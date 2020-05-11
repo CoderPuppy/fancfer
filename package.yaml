@@ -25,12 +25,28 @@ dependencies:
 - unix
 - containers
 - text
+- lens
+- profunctors
+- data-fix
 
 default-extensions:
-- DuplicateRecordFields
-- GADTs
-- OverloadedStrings
+- DataKinds
+- DefaultSignatures
 - DeriveFunctor
+- DuplicateRecordFields
+- FlexibleInstances
+- GADTs
+- KindSignatures
+- LambdaCase
+- MultiParamTypeClasses
+- NamedFieldPuns
+- OverloadedLabels
+- OverloadedStrings
+- ScopedTypeVariables
+- TemplateHaskell
+- TupleSections
+- UndecidableInstances
+- ViewPatterns
 
 ghc-options:
 - -Wno-tabs
