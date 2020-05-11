@@ -28,14 +28,18 @@ dependencies:
 - lens
 - profunctors
 - data-fix
+- transformers
+- mtl
 
 default-extensions:
 - DataKinds
 - DefaultSignatures
 - DeriveFunctor
 - DuplicateRecordFields
+- FlexibleContexts
 - FlexibleInstances
 - GADTs
+- GeneralizedNewtypeDeriving
 - KindSignatures
 - LambdaCase
 - MultiParamTypeClasses

@@ -1,26 +1,31 @@
 module Fancfer.W3 where
 
 import Control.Arrow
+import Control.Category
 import Control.Lens hiding (_Just)
 import Control.Lens.TH (makePrisms)
+import Control.Monad.Trans.Class
+import Control.Monad.Trans.State
 import Data.Bool
 import Data.Fix
 import Data.Foldable
+import Data.Functor.Identity
 import Data.Maybe
+import Data.Monoid
 import Data.Profunctor
 import Data.Tuple
 import GHC.OverloadedLabels
-import Text.Read
+import Prelude hiding (id, (.))
+import Text.Read (readMaybe)
 import qualified Data.Map as M
 import qualified Data.Text as T
-import Control.Monad.Trans.Writer.Lazy
-import Data.Monoid
 
 class Functor f => Pure f where
 	pure' :: a -> f a
 	default pure' :: Applicative f => a -> f a
 	pure' = pure
-instance (Functor f, Applicative f) => Pure f
+instance Monoid r => Pure (Const r)
+instance Monoid r => Pure ((,) r)
 
 _Just :: (Choice p, Pure f) => p a (f b) -> p (Maybe a) (f (Maybe b))
 _Just = dimap (\case {
@@ -139,23 +144,85 @@ sourceDeps path (Source STDescend arg _) dt
 sourceDeps path (Source STAutoCommit arg _) dt
 	= deps (PPSrcArg:path) arg $ dtPath [PPDir "value"] DTRel
 
+data Value' sv
+	= V'Dir (M.Map T.Text (Value sv)) T.Text
+	| V'SourcedArg SourceType sv
+	| V'SourcedVal SourceType (Value sv)
+	| V'FakeReal
+	deriving (Show)
+
+zipperBackRef :: Pure f => (Int, Int) ->
+	((Value sv, [Value' sv]) -> f (Value sv, [Value' sv])) ->
+	(Value sv, [Value' sv]) -> f (Value sv, [Value' sv])
+zipperBackRef (0, 0) f (v, zp) = f (v, zp)
+zipperBackRef _ f (v, []) = pure' (v, [])
+-- zipperBackRef (0, nSrc) f (v, V'SourcedVal st arg:zp) = fmap (error "TODO") $ zipperBackRef (0, nSrc - 1) f (VSourced (Source st arg (error "TODO")), zp)
+-- zipperBackRef (nReal, nSrc) f (v, V'SourcedVal st arg:zp) = fmap (error "TODO") $ zipperBackRef (nReal, nSrc) f (VSourced (Source st arg (error "TODO")), zp)
+zipperBackRef (nReal, nSrc) f (v, V'SourcedArg st sv:zp)
+	= fmap after $ zipperBackRef (nReal - 1, nSrc) f (VSourced (Source st v sv), zp)
+	where after (VSourced (Source st arg sv), zp) = (arg, V'SourcedArg st sv:zp)
+zipperBackRef (nReal, nSrc) f (v, V'Dir entries name:zp)
+	= fmap after $ zipperBackRef (nReal - 1, nSrc) f (VDir (M.insert name v entries), zp)
+	where after (VDir entries, zp) = (fromJust $ M.lookup name entries, V'Dir (M.delete name entries) name:zp)
+-- zipperBackRef zp (0, 0) = Just zp
+-- zipperBackRef [] _ = Nothing
+-- zipperBackRef (V'SourcedVal _ _:zp) (0, nSrc) = zipperBackRef zp (0, nSrc - 1)
+-- zipperBackRef (V'SourcedVal _ _:zp) (nReal, nSrc) = zipperBackRef zp (nReal, nSrc)
+-- zipperBackRef (V'SourcedArg _ _:zp) (nReal, nSrc) = zipperBackRef zp (nReal - 1, nSrc)
+-- zipperBackRef (V'Dir _ _:zp) (nReal, nSrc) = zipperBackRef zp (nReal - 1, nSrc)
+
 fixReal :: Fix' Value -> Fix' Value
 fixReal (VSourced (Source {val})) = fixReal $ unFix val
 fixReal (VFakeReal val) = val
 fixReal v = v
 
-descend :: Pure f => Path -> (Value () -> f (Value ())) -> Value () -> f (Value ())
+descend :: (Pure f, FBackRef f) => Path -> (Value () -> f (Value ())) -> Value () -> f (Value ())
 descend [] = id
 descend (PPDir name:path) = real.dirAt name._Just.descend path
 -- TODO
 
-srcLens :: Pure f => SourceType -> (Value () -> f (Value ())) -> Value () -> f (Value ())
+class FBackRef f where
+	fBackRef :: ([Value' ()] -> (f a, [Value' ()])) -> f a
+
+newtype FBackRefT m a = FBackRefT { runFBackRefT :: StateT [Value' ()] m a }
+	deriving (Functor, Applicative, Monad, MonadTrans, Contravariant)
+instance FBackRef (FBackRefT m) where
+	fBackRef f = FBackRefT $ StateT $ uncurry runStateT . first runFBackRefT . f
+instance Pure m => Pure (FBackRefT m) where
+	pure' a = FBackRefT $ StateT $ \s -> pure' (a, s)
+
+liftFBackRefT :: Functor m => m a -> FBackRefT m a
+liftFBackRefT m = FBackRefT $ StateT $ \s -> fmap (, s) m
+
+fBackRef_runGet :: FBackRef f => FBackRefT (Const r) b -> (r -> f a) -> f a
+fBackRef_runGet f k = fBackRef $ \s -> (, s) $ k $ getConst $ runStateT (runFBackRefT f) s
+
+fBackRefT_get :: ((a -> FBackRefT (Const r) b) -> s -> FBackRefT (Const r) t) -> (a -> r) -> s -> FBackRefT (Const r) t
+fBackRefT_get o f v = o (liftFBackRefT . Const . f) v
+
+srcLens :: (Pure f, FBackRef f) => SourceType -> (Value () -> f (Value ())) -> Value () -> f (Value ())
 srcLens STCommitLog = dirAt "index"._Just.real
-srcLens STDescend = \f arg -> fromMaybe (pure' arg) $ do
-	to <- arg^?dirAt "to"._Just.real._VText.to T.unpack.to readMaybe._Just
-	-- TODO: sources in from?
-	pure $ (dirAt "from"._Just.descend to) f arg
-srcLens STAutoCommit = \f currCommit -> let
+srcLens STBackRef = \f arg ->
+	fBackRef_runGet
+		(fBackRefT_get (real._VText.to T.unpack.to readMaybe._Just) pure arg)
+		$ \(First ns) ->
+		fromMaybe (pure' arg) $ do
+			(nReal, nSrc) <- ns
+			pure $ fBackRef $ \zp -> let
+					(w1, (arg', zp')) = zipperBackRef (nReal, nSrc)
+						(\v -> (_, v))
+						(VSourced $ Source STBackRef arg (), zp)
+				in (pure' arg', zp')
+srcLens STDescend = \f arg ->
+	fBackRef_runGet
+		(fBackRefT_get (dirAt "to"._Just.real._VText.to T.unpack.to readMaybe._Just) pure arg)
+		$ \(First to) ->
+		fromMaybe (pure' arg) $ do
+			to <- to
+			-- TODO: sources in from?
+			pure $ (dirAt "from"._Just.descend to) f arg
+srcLens STAutoCommit = \f currCommit ->
+	let
 		newCommit newVal = VDir $ M.fromList [
 				("value",) $ newVal,
 				("message",) $ VText "Auto Commit: TODO",
@@ -163,19 +230,23 @@ srcLens STAutoCommit = \f currCommit -> let
 					("1",) $ currCommit
 				]
 			]
-	in fromMaybe (pure' currCommit) $
-		fmap (fmap newCommit . f) $ currCommit^?dirAt "value"._Just
+	in fBackRef_runGet
+		(fBackRefT_get (dirAt "value"._Just) pure currCommit)
+		(fromMaybe (pure' currCommit) .  fmap (fmap newCommit . f) . getFirst)
 
-srcVal :: Pure f => (Value () -> f (Value ())) -> Source () -> f (Source ())
+srcVal :: (Pure f, FBackRef f) => (Value () -> f (Value ())) -> Source () -> f (Source ())
 srcVal f src@(Source st arg ()) = (#arg . real . srcLens st) f src
 
-real :: Pure f => (Value () -> f (Value ())) -> Value () -> f (Value ())
+real :: (Pure f, FBackRef f) => (Value () -> f (Value ())) -> Value () -> f (Value ())
 real f (VSourced s) = fmap VSourced $ (srcVal.real) f s
 real f (VFakeReal v) = fmap VFakeReal $ f v
 real f v = f v
 
-dirAt :: Pure f => T.Text -> (Maybe (Value ()) -> f (Maybe (Value ()))) -> Value () -> f (Value ())
+dirAt :: (Pure f, FBackRef f) => T.Text -> (Maybe (Value ()) -> f (Maybe (Value ()))) -> Value () -> f (Value ())
 dirAt name = _VDir . at name
+
+dirEntries :: (Indexable T.Text p, Applicative f, Pure f) => p (Value sv) (f (Value sv)) -> Value sv -> f (Value sv)
+dirEntries = _VDir . itraversed
 
 testV = VSourced $ flip (Source STCommitLog) () $ VDir $ M.fromList [
 		("HEAD",) $ VNoCommit,
