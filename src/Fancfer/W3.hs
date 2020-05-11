@@ -49,19 +49,19 @@ data Value sv
 	| VCommit (Commit sv) | VNoCommit -- TODO
 	| VBackRefCycle -- TODO
 	| VFakeReal (Value sv)
-	deriving (Show)
+	deriving (Show, Eq)
 _VDir :: (Choice p, Pure f) => p (M.Map T.Text (Value sv)) (f (M.Map T.Text (Value sv))) -> p (Value sv) (f (Value sv))
 _VDir = dimap (\case { VDir a -> Left a; v -> Right v }) (either (fmap VDir) pure') . left'
 _VText :: (Choice p, Pure f) => p T.Text (f T.Text) -> p (Value sv) (f (Value sv))
 _VText = dimap (\case { VText a -> Left a; v -> Right v }) (either (fmap VText) pure') . left'
 
-data SourceType = STCommitLog | STBackRef | STDescend | STAutoCommit deriving (Show)
+data SourceType = STCommitLog | STBackRef | STDescend | STAutoCommit deriving (Show, Eq)
 -- STRepo, STBackRef, STCommitLog, STDescend, STAutoCommit
 data Source sv = Source {
 	_type :: SourceType,
 	arg :: Value sv,
 	val :: sv
-} deriving (Show)
+} deriving (Show, Eq)
 instance (Strong p, Functor f) => IsLabel "type" (p SourceType (f SourceType) -> p (Source sv) (f (Source sv))) where
 	fromLabel = dimap (\c@(Source {_type}) -> (_type, c)) (\(_type, c) -> fmap (\_type -> c {_type}) _type) . first'
 instance (Strong p, Functor f) => IsLabel "arg" (p (Value sv) (f (Value sv)) -> p (Source sv) (f (Source sv))) where
@@ -73,7 +73,7 @@ data Commit sv = Commit {
 	value :: Value sv,
 	message :: T.Text,
 	parents :: [Value sv]
-} deriving (Show)
+} deriving (Show, Eq)
 instance (Strong p, Functor f) => IsLabel "value" (p (Value sv) (f (Value sv)) -> p (Commit sv) (f (Commit sv))) where
 	fromLabel = dimap (\c@(Commit {value}) -> (value, c)) (\(value, c) -> fmap (\value -> c {value}) value) . first'
 instance (Strong p, Functor f) => IsLabel "message" (p T.Text (f T.Text) -> p (Commit sv) (f (Commit sv))) where
@@ -262,7 +262,8 @@ srcLens STDescend = \f arg ->
 			pure $ (dirAt "from"._Just.descend to) f arg
 srcLens STAutoCommit = \f currCommit ->
 	let
-		newCommit newVal = VDir $ M.fromList [
+		newCommit currVal newVal | currVal == newVal = currCommit
+		newCommit currVal newVal = VDir $ M.fromList [
 				("value",) $ newVal,
 				("message",) $ VText "Auto Commit: TODO",
 				("parents",) $ VDir $ M.fromList [
@@ -271,7 +272,8 @@ srcLens STAutoCommit = \f currCommit ->
 			]
 	in fBackRef_runGet
 		(fBackRefT_get (dirAt "value"._Just) pure currCommit)
-		(fromMaybe (pure' currCommit) .  fmap (fmap newCommit . f) . getFirst)
+		$ \(First currVal) ->
+		fromMaybe (pure' currCommit) $ fmap (uncurry fmap . (newCommit &&& f)) currVal
 
 srcArg :: (Pure f, FBackRef f) => (Value () -> f (Value ())) -> Source () -> f (Source ())
 srcArg f = fmap fst . fBackRef'
