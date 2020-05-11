@@ -187,12 +187,7 @@ fixReal (VFakeReal val) = val
 fixReal v = v
 
 class Pure f => FBackRef f where
-	fBackRef :: ([Value' ()] -> (f a, [Value' ()])) -> f a
-
-	-- fBackRef_1 :: FBackRefT (Const r) b -> (r -> f a) -> f a
-	-- fBackRef_2 :: Lens [Value' ()] [Value' ()] (a, [Value' ()]) (b, [Value' ()]) -> (a -> f (c, b)) -> f c
-	-- fBackRef_2 :: (((a, [Value' ()]) -> g (b, [Value' ()])) -> [Value' ()] -> g [Value' ()]) -> (a -> f (c, b)) -> f c
-	fBackRef_2' ::
+	fBackRef' ::
 		(
 			forall g. Functor g =>
 			(Indexed i (a, [Value' ()]) (g (b, [Value' ()]))) ->
@@ -200,7 +195,7 @@ class Pure f => FBackRef f where
 		) ->
 		(i -> a -> f (r, b)) ->
 		c -> f (d, r)
-	fBackRef_2 ::
+	fBackRef ::
 		(
 			forall g. Pure g =>
 			(Indexed i (a, [Value' ()]) (g (b, [Value' ()]))) ->
@@ -214,14 +209,13 @@ newtype FBackRefT m a = FBackRefT { runFBackRefT :: StateT [Value' ()] m a }
 instance Pure m => Pure (FBackRefT m) where
 	pure' a = FBackRefT $ StateT $ \s -> pure' (a, s)
 instance Pure m => FBackRef (FBackRefT m) where
-	fBackRef f = FBackRefT $ StateT $ uncurry runStateT . first runFBackRefT . f
-	fBackRef_2' l f c =
+	fBackRef' l f c =
 		FBackRefT $ StateT $ \zp ->
 		fmap (\((d, zp), r) -> ((d, r), zp)) $
 		runWriterT $ flip l (c, zp) $ Indexed $ \i (a, zp) -> WriterT $
 		fmap (\((c, b), zp) -> ((b, zp), c)) $
 		flip runStateT zp $ runFBackRefT $ f i a
-	fBackRef_2 l f c =
+	fBackRef l f c =
 		FBackRefT $ StateT $ \zp ->
 		fmap (\((d, zp), r) -> ((d, getFirst r), zp)) $
 		runWriterT $ flip l (c, zp) $ Indexed $ \i (a, zp) -> WriterT $
@@ -233,7 +227,7 @@ liftFBackRefT m = FBackRefT $ StateT $ \s -> fmap (, s) m
 
 fBackRef_runGet :: FBackRef f => FBackRefT (Const r) b -> (r -> f a) -> f a
 -- fBackRef_runGet f k = fBackRef $ \s -> (, s) $ k $ getConst $ runStateT (runFBackRefT f) s
-fBackRef_runGet f k = fmap snd $ fBackRef_2'
+fBackRef_runGet f k = fmap snd $ fBackRef'
 	(\f ((), zp) -> indexed f () (zp, zp))
 	(\() zp -> fmap (, ()) $ k $ getConst $ runStateT (runFBackRefT f) zp)
 	()
@@ -254,7 +248,7 @@ srcLens STBackRef = \f arg ->
 		$ \(First ns) ->
 		fmap (const arg) $ fromMaybe (pure' ()) $ do
 			(nReal, nSrc) <- ns
-			pure $ fmap (const ()) $ fBackRef_2
+			pure $ fmap (const ()) $ fBackRef
 				(\f ((), zp) -> fmap (first $ const ()) $ zipperBackRef (nReal, nSrc) f (VBackRefCycle, zp))
 				(\path v -> fmap ((),) $ f v)
 				()
@@ -280,7 +274,7 @@ srcLens STAutoCommit = \f currCommit ->
 		(fromMaybe (pure' currCommit) .  fmap (fmap newCommit . f) . getFirst)
 
 srcArg :: (Pure f, FBackRef f) => (Value () -> f (Value ())) -> Source () -> f (Source ())
-srcArg f = fmap fst . fBackRef_2'
+srcArg f = fmap fst . fBackRef'
 	(\f (Source st arg (), zp) ->
 		fmap (\(arg, V'SourcedArg st ():zp) -> (Source st arg (), zp)) $
 		indexed f () (arg, V'SourcedArg st ():zp))
@@ -295,7 +289,7 @@ real f (VFakeReal v) = fmap VFakeReal $ f v
 real f v = f v
 
 dirAt :: (Pure f, FBackRef f) => T.Text -> (Maybe (Value ()) -> f (Maybe (Value ()))) -> Value () -> f (Value ())
-dirAt name = _VDir . \f -> fmap fst . fBackRef_2'
+dirAt name = _VDir . \f -> fmap fst . fBackRef'
 	(\f (entries, zp) ->
 		fmap (\(v, V'Dir entries name:zp) -> (M.alter (const v) name entries, zp)) $
 		indexed f () (M.lookup name entries, V'Dir (M.delete name entries) name:zp))
@@ -311,7 +305,7 @@ dirEntries = _VDir . \f entries -> ifoldr (go f) (pure' entries) entries
 			f (M.Map T.Text (Value ())) -> f (M.Map T.Text (Value ()))
 		go f name v entries = do
 			entries <- entries
-			fmap fst $ fBackRef_2'
+			fmap fst $ fBackRef'
 				(\f (entries, zp) ->
 					fmap (\(v, V'Dir entries name:zp) -> (M.alter (const v) name entries, zp)) $
 					indexed f () (M.lookup name entries, V'Dir (M.delete name entries) name:zp))
