@@ -46,7 +46,6 @@ data Value sv
 	= VText T.Text
 	| VDir (M.Map T.Text (Value sv))
 	| VSourced (Source sv)
-	| VCommit (Commit sv) | VNoCommit -- TODO
 	| VBackRefCycle -- TODO
 	| VFakeReal (Value sv)
 	deriving (Show, Eq)
@@ -68,18 +67,6 @@ instance (Strong p, Functor f) => IsLabel "arg" (p (Value sv) (f (Value sv)) -> 
 	fromLabel = dimap (\c@(Source {arg}) -> (arg, c)) (\(arg, c) -> fmap (\arg -> c {arg}) arg) . first'
 instance (Strong p, Functor f) => IsLabel "val" (p sv (f sv) -> p (Source sv) (f (Source sv))) where
 	fromLabel = dimap (\c@(Source {val}) -> (val, c)) (\(val, c) -> fmap (\val -> c {val}) val) . first'
-
-data Commit sv = Commit {
-	value :: Value sv,
-	message :: T.Text,
-	parents :: [Value sv]
-} deriving (Show, Eq)
-instance (Strong p, Functor f) => IsLabel "value" (p (Value sv) (f (Value sv)) -> p (Commit sv) (f (Commit sv))) where
-	fromLabel = dimap (\c@(Commit {value}) -> (value, c)) (\(value, c) -> fmap (\value -> c {value}) value) . first'
-instance (Strong p, Functor f) => IsLabel "message" (p T.Text (f T.Text) -> p (Commit sv) (f (Commit sv))) where
-	fromLabel = dimap (\c@(Commit {message}) -> (message, c)) (\(message, c) -> fmap (\message -> c {message}) message) . first'
-instance (Strong p, Functor f) => IsLabel "parents" (p [Value sv] (f [Value sv]) -> p (Commit sv) (f (Commit sv))) where
-	fromLabel = dimap (\c@(Commit {parents}) -> (parents, c)) (\(parents, c) -> fmap (\parents -> c {parents}) parents) . first'
 
 data PathPart = PPDir T.Text | PPSrcArg | PPSrcVal deriving (Show, Read)
 type Path = [PathPart]
@@ -162,6 +149,7 @@ zipperBackRef :: (Indexable Path p, Pure f) => (Int, Int) ->
 	(Value sv, [Value' sv]) -> f (Value sv, [Value' sv])
 zipperBackRef (0, 0) f (v, zp) = indexed f ([] :: Path) (v, zp)
 zipperBackRef _ f (v, []) = pure' (v, [])
+-- TODO
 -- zipperBackRef (0, nSrc) f (v, V'SourcedVal st arg:zp) = fmap (error "TODO") $ zipperBackRef (0, nSrc - 1) f (VSourced (Source st arg (error "TODO")), zp)
 -- zipperBackRef (nReal, nSrc) f (v, V'SourcedVal st arg:zp) = fmap (error "TODO") $ zipperBackRef (nReal, nSrc) f (VSourced (Source st arg (error "TODO")), zp)
 zipperBackRef (nReal, nSrc) f (v, V'SourcedArg st sv:zp)
@@ -174,12 +162,6 @@ zipperBackRef (nReal, nSrc) f (v, V'Dir entries name:zp)
 	where
 		after (VDir entries, zp) = (fromJust $ M.lookup name entries, V'Dir (M.delete name entries) name:zp)
 		f' = Indexed $ \path (v, zp) -> indexed f (PPDir name:path) (v, zp)
--- zipperBackRef zp (0, 0) = Just zp
--- zipperBackRef [] _ = Nothing
--- zipperBackRef (V'SourcedVal _ _:zp) (0, nSrc) = zipperBackRef zp (0, nSrc - 1)
--- zipperBackRef (V'SourcedVal _ _:zp) (nReal, nSrc) = zipperBackRef zp (nReal, nSrc)
--- zipperBackRef (V'SourcedArg _ _:zp) (nReal, nSrc) = zipperBackRef zp (nReal - 1, nSrc)
--- zipperBackRef (V'Dir _ _:zp) (nReal, nSrc) = zipperBackRef zp (nReal - 1, nSrc)
 
 fixReal :: Fix' Value -> Fix' Value
 fixReal (VSourced (Source {val})) = fixReal $ unFix val
@@ -226,7 +208,6 @@ liftFBackRefT :: Functor m => m a -> FBackRefT m a
 liftFBackRefT m = FBackRefT $ StateT $ \s -> fmap (, s) m
 
 fBackRef_runGet :: FBackRef f => FBackRefT (Const r) b -> (r -> f a) -> f a
--- fBackRef_runGet f k = fBackRef $ \s -> (, s) $ k $ getConst $ runStateT (runFBackRefT f) s
 fBackRef_runGet f k = fmap snd $ fBackRef'
 	(\f ((), zp) -> indexed f () (zp, zp))
 	(\() zp -> fmap (, ()) $ k $ getConst $ runStateT (runFBackRefT f) zp)
@@ -260,8 +241,7 @@ srcLens STDescend = \f arg ->
 			to <- to
 			-- TODO: sources in from?
 			pure $ (dirAt "from"._Just.descend to) f arg
-srcLens STAutoCommit = \f currCommit ->
-	let
+srcLens STAutoCommit = \f currCommit -> let
 		newCommit currVal newVal | currVal == newVal = currCommit
 		newCommit currVal newVal = VDir $ M.fromList [
 				("value",) $ newVal,
@@ -296,26 +276,22 @@ dirAt name = _VDir . \f -> fmap fst . fBackRef'
 		fmap (\(v, V'Dir entries name:zp) -> (M.alter (const v) name entries, zp)) $
 		indexed f () (M.lookup name entries, V'Dir (M.delete name entries) name:zp))
 	(\() v -> fmap ((),) $ f v)
--- dirAt name = _VDir . at name
 
 dirEntries :: forall p f. (Indexable T.Text p, Monad f, Pure f, FBackRef f) =>
 	p (Maybe (Value ())) (f (Maybe (Value ()))) ->
 	Value () -> f (Value ())
 dirEntries = _VDir . \f entries -> ifoldr (go f) (pure' entries) entries
-	where
-		go :: p (Maybe (Value ())) (f (Maybe (Value ()))) -> T.Text -> Value () ->
-			f (M.Map T.Text (Value ())) -> f (M.Map T.Text (Value ()))
-		go f name v entries = do
-			entries <- entries
-			fmap fst $ fBackRef'
-				(\f (entries, zp) ->
-					fmap (\(v, V'Dir entries name:zp) -> (M.alter (const v) name entries, zp)) $
-					indexed f () (M.lookup name entries, V'Dir (M.delete name entries) name:zp))
-				(\() v -> fmap ((),) $ indexed f name v)
-				entries
+	where go f name v entries = do
+		entries <- entries
+		fmap fst $ fBackRef'
+			(\f (entries, zp) ->
+				fmap (\(v, V'Dir entries name:zp) -> (M.alter (const v) name entries, zp)) $
+				indexed f () (M.lookup name entries, V'Dir (M.delete name entries) name:zp))
+			(\() v -> fmap ((),) $ indexed f name v)
+			entries
 
 testV = VSourced $ flip (Source STCommitLog) () $ VDir $ M.fromList [
-		("HEAD",) $ VNoCommit,
+		("HEAD",) $ VText "NO COMMIT",
 		("index",) $ VDir $ M.fromList [ ]
 		-- TODO: what if I want a source in the index?
 	]
@@ -357,20 +333,3 @@ test_get v l = snd $ runIdentity $ runWriterT $ flip runStateT [] $ runFBackRefT
 test_set v l v' = fst $ runIdentity $ flip runStateT [] $ runFBackRefT $ l (const $ pure' v') v
 test_zp v l = snd $ runIdentity $ runWriterT $ flip runStateT [] $ runFBackRefT $ flip l v $
 	\v -> FBackRefT $ StateT $ \zp -> tell [zp] *> pure (v, zp)
-
--- CommitLog - Dir
--- 	HEAD - Descend - Dir
--- 		from - BackRef - Text
--- 			(0, 0)
--- 		to - Text
--- 			[PPDir "refs", PPDir "heads", PPDir "master"]
---	index - Dir
---	refs - AutoCommit - Dir
---		heads - Dir
---			master - Dir
---				value - Dir
---				message - Text
---					Initial Commit
---				parents - Dir
-
--- TODO: backref
