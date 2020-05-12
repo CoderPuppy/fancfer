@@ -4,7 +4,7 @@ import Control.Arrow
 import Control.Category
 import Control.Lens hiding (_Just)
 import Control.Lens.TH (makePrisms)
-import Control.Monad.Trans.Class
+import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
 import Control.Monad.Trans.Writer.Lazy
 import Data.Bool
@@ -15,32 +15,14 @@ import Data.Maybe
 import Data.Monoid
 import Data.Profunctor
 import Data.Tuple
+import Debug.Trace
 import GHC.OverloadedLabels
 import Prelude hiding (id, (.))
 import Text.Read (readMaybe)
 import qualified Data.Map as M
 import qualified Data.Text as T
-import Debug.Trace
 
-class Functor f => Pure f where
-	pure' :: a -> f a
-	default pure' :: Applicative f => a -> f a
-	pure' = pure
-instance Monoid r => Pure (Const r)
-instance Monoid r => Pure ((,) r)
-instance (Pure m, Monoid w) => Pure (WriterT w m) where
-	pure' = WriterT . pure' . (, mempty)
-instance Pure Identity
-instance Pure IO
-
-_Just :: (Choice p, Pure f) => p a (f b) -> p (Maybe a) (f (Maybe b))
-_Just = dimap (\case {
-		Just a -> Left a;
-		Nothing -> Right ()
-	}) (either (fmap Just) (const $ pure' Nothing)) . left'
-type Fix' f = f (Fix f)
-_Fix :: (Profunctor p, Functor f) => p (Fix' a) (f (Fix' b)) -> p (Fix a) (f (Fix b))
-_Fix = dimap unFix (fmap Fix)
+import Fancfer.W4
 
 data Value sv
 	= VText T.Text
@@ -53,6 +35,8 @@ _VDir :: (Choice p, Pure f) => p (M.Map T.Text (Value sv)) (f (M.Map T.Text (Val
 _VDir = dimap (\case { VDir a -> Left a; v -> Right v }) (either (fmap VDir) pure') . left'
 _VText :: (Choice p, Pure f) => p T.Text (f T.Text) -> p (Value sv) (f (Value sv))
 _VText = dimap (\case { VText a -> Left a; v -> Right v }) (either (fmap VText) pure') . left'
+_VSourced :: (Choice p, Pure f) => p (Source sv) (f (Source sv)) -> p (Value sv) (f (Value sv))
+_VSourced = dimap (\case { VSourced a -> Left a; v -> Right v }) (either (fmap VSourced) pure') . left'
 
 data SourceType = STCommitLog | STBackRef | STDescend | STAutoCommit deriving (Show, Eq)
 -- STRepo, STBackRef, STCommitLog, STDescend, STAutoCommit
@@ -186,46 +170,57 @@ class Pure f => FBackRef f where
 		(i -> a -> f (r, b)) ->
 		c -> f (d, Maybe r)
 
-newtype FBackRefT m a = FBackRefT { runFBackRefT :: StateT [Value' ()] m a }
-	deriving (Functor, Applicative, Monad, MonadTrans, Contravariant)
-instance Pure m => Pure (FBackRefT m) where
-	pure' a = FBackRefT $ StateT $ \s -> pure' (a, s)
-instance Pure m => FBackRef (FBackRefT m) where
+class FMessage f where
+	fMessage :: f (Maybe T.Text -> f a) -> f a
+
+newtype FFT m a = FFT { runFFT :: StateT [Value' ()] (RT (Maybe T.Text) m) a }
+	deriving (Functor, Applicative, Monad, Contravariant)
+instance Pure m => Pure (FFT m) where
+	pure' a = FFT $ StateT $ \s -> pure' (a, s)
+instance Pure m => FBackRef (FFT m) where
 	fBackRef' l f c =
-		FBackRefT $ StateT $ \zp ->
+		FFT $ StateT $ \zp ->
 		fmap (\((d, zp), r) -> ((d, r), zp)) $
 		runWriterT $ flip l (c, zp) $ Indexed $ \i (a, zp) -> WriterT $
 		fmap (\((c, b), zp) -> ((b, zp), c)) $
-		flip runStateT zp $ runFBackRefT $ f i a
+		flip runStateT zp $ runFFT $ f i a
 	fBackRef l f c =
-		FBackRefT $ StateT $ \zp ->
+		FFT $ StateT $ \zp ->
 		fmap (\((d, zp), r) -> ((d, getFirst r), zp)) $
 		runWriterT $ flip l (c, zp) $ Indexed $ \i (a, zp) -> WriterT $
 		fmap (\((c, b), zp) -> ((b, zp), First $ Just c)) $
-		flip runStateT zp $ runFBackRefT $ f i a
+		flip runStateT zp $ runFFT $ f i a
+deriving instance (Base b m, Pure m) => Base b (FFT m)
+instance (Pure m, FakeMonad m) => FMessage (FFT m) where
+	fMessage f = FFT $ StateT $ \s -> RT $ fmap
+		(\f r ->
+			fakeJoin $ fmap ($ r) $ fakeJoin $
+			fmap (runRT . uncurry ($) . first (runStateT . runFFT . ($ r))) $ f r)
+		(runRT $ flip runStateT s $ runFFT f)
+instance Trans FFT where
+	lift = FFT . lift . lift
 
-liftFBackRefT :: Functor m => m a -> FBackRefT m a
-liftFBackRefT m = FBackRefT $ StateT $ \s -> fmap (, s) m
-
-fBackRef_runGet :: FBackRef f => FBackRefT (Const r) b -> (r -> f a) -> f a
-fBackRef_runGet f k = fmap snd $ fBackRef'
+runGet :: (FBackRef f, FMessage f) => FFT (Const r) b -> (r -> f a) -> f a
+runGet f k = fmap snd $ fBackRef'
 	(\f ((), zp) -> indexed f () (zp, zp))
-	(\() zp -> fmap (, ()) $ k $ getConst $ runStateT (runFBackRefT f) zp)
+	(\() zp ->
+		fmap (, ()) $ k $ getConst $
+		runRT $ flip runStateT zp $ runFFT f)
 	()
 
-fBackRefT_get :: ((a -> FBackRefT (Const r) b) -> s -> FBackRefT (Const r) t) -> (a -> r) -> s -> FBackRefT (Const r) t
-fBackRefT_get o f v = o (liftFBackRefT . Const . f) v
+mget :: Base (Const r) f => ((a -> f b) -> s -> f t) -> (a -> r) -> s -> f t
+mget o f v = o (liftBase . Const . f) v
 
-descend :: (Pure f, FBackRef f) => Path -> (Value () -> f (Value ())) -> Value () -> f (Value ())
+descend :: (Pure f, FBackRef f, FMessage f) => Path -> (Value () -> f (Value ())) -> Value () -> f (Value ())
 descend [] = id
 descend (PPDir name:path) = real.dirAt name._Just.descend path
 -- TODO
 
-srcLens :: (Pure f, FBackRef f) => SourceType -> (Value () -> f (Value ())) -> Value () -> f (Value ())
+srcLens :: (Pure f, FBackRef f, FMessage f) => SourceType -> (Value () -> f (Value ())) -> Value () -> f (Value ())
 srcLens STCommitLog = dirAt "index"._Just.real
 srcLens STBackRef = \f arg ->
-	fBackRef_runGet
-		(fBackRefT_get (real._VText.to T.unpack.to readMaybe._Just) pure arg)
+	runGet
+		(mget (real._VText.to T.unpack.to readMaybe._Just) pure arg)
 		$ \(First ns) ->
 		fmap (const arg) $ fromMaybe (pure' ()) $ do
 			(nReal, nSrc) <- ns
@@ -234,26 +229,26 @@ srcLens STBackRef = \f arg ->
 				(\path v -> fmap ((),) $ f v)
 				()
 srcLens STDescend = \f arg ->
-	fBackRef_runGet
-		(fBackRefT_get (dirAt "to"._Just.real._VText.to T.unpack.to readMaybe._Just) pure arg)
+	runGet
+		(mget (dirAt "to"._Just.real._VText.to T.unpack.to readMaybe._Just) pure arg)
 		$ \(First to) ->
 		fromMaybe (pure' arg) $ do
 			to <- to
 			-- TODO: sources in from?
 			pure $ (dirAt "from"._Just.descend to) f arg
 srcLens STAutoCommit = \f currCommit -> let
-		newCommit currVal newVal | currVal == newVal = currCommit
-		newCommit currVal newVal = VDir $ M.fromList [
+		newCommit currVal newVal msg | currVal == newVal = currCommit
+		newCommit currVal newVal msg = VDir $ M.fromList [
 				("value",) $ newVal,
-				("message",) $ VText "Auto Commit: TODO",
+				("message",) $ VText $ maybe "Auto Commit" ("Auto Commit: " <>) msg,
 				("parents",) $ VDir $ M.fromList [
 					("1",) $ currCommit
 				]
 			]
-	in fBackRef_runGet
-		(fBackRefT_get (dirAt "value"._Just) pure currCommit)
+	in runGet
+		(mget (dirAt "value"._Just) pure currCommit)
 		$ \(First currVal) ->
-		fromMaybe (pure' currCommit) $ fmap (uncurry fmap . (newCommit &&& f)) currVal
+		fromMaybe (pure' currCommit) $ fmap (fMessage . fmap (pure' .) . uncurry fmap . (newCommit &&& f)) currVal
 
 srcArg :: (Pure f, FBackRef f) => (Value () -> f (Value ())) -> Source () -> f (Source ())
 srcArg f = fmap fst . fBackRef'
@@ -262,10 +257,10 @@ srcArg f = fmap fst . fBackRef'
 		indexed f () (arg, V'SourcedArg st ():zp))
 	(\() arg -> fmap ((),) $ f arg)
 
-srcVal :: (Pure f, FBackRef f) => (Value () -> f (Value ())) -> Source () -> f (Source ())
+srcVal :: (Pure f, FBackRef f, FMessage f) => (Value () -> f (Value ())) -> Source () -> f (Source ())
 srcVal f src@(Source st arg ()) = (srcArg . real . srcLens st) f src
 
-real :: (Pure f, FBackRef f) => (Value () -> f (Value ())) -> Value () -> f (Value ())
+real :: (Pure f, FBackRef f, FMessage f) => (Value () -> f (Value ())) -> Value () -> f (Value ())
 real f (VSourced s) = fmap VSourced $ (srcVal.real) f s
 real f (VFakeReal v) = fmap VFakeReal $ f v
 real f v = f v
@@ -328,8 +323,9 @@ testV4 = VDir $ M.fromList [
 		("testing",) $ VSourced $ flip (Source STBackRef) () $ VText $ T.pack $ show (1, 0)
 	]
 
-test_get v l = snd $ runIdentity $ runWriterT $ flip runStateT [] $ runFBackRefT $ flip l v $
-	\v -> liftFBackRefT (tell [v]) *> pure v
-test_set v l v' = fst $ runIdentity $ flip runStateT [] $ runFBackRefT $ l (const $ pure' v') v
-test_zp v l = snd $ runIdentity $ runWriterT $ flip runStateT [] $ runFBackRefT $ flip l v $
-	\v -> FBackRefT $ StateT $ \zp -> tell [zp] *> pure (v, zp)
+test_get v l = snd $ runIdentity $ runWriterT $ runRT $ flip runStateT [] $ runFFT $
+	flip l v $ \v -> lift (tell [v]) *> pure v
+test_set v msg l v' = fst $ runIdentity $ ($ msg) $ runIdentity $ runRT $ flip runStateT [] $ runFFT $
+	l (const $ pure' v') v
+test_zp v l = snd $ runIdentity $ runWriterT $ runRT $ flip runStateT [] $ runFFT $ flip l v $
+	\v -> FFT $ StateT $ \zp -> RT $ tell [zp] *> pure (const $ pure (v, zp))

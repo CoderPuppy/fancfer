@@ -28,8 +28,8 @@ dependencies:
 - lens
 - profunctors
 - data-fix
-- transformers
 - mtl
+- transformers
 
 default-extensions:
 - ApplicativeDo
@@ -42,6 +42,7 @@ default-extensions:
 - FunctionalDependencies
 - GADTs
 - GeneralizedNewtypeDeriving
+- InstanceSigs
 - KindSignatures
 - LambdaCase
 - MultiParamTypeClasses
@@ -50,6 +51,7 @@ default-extensions:
 - OverloadedStrings
 - RankNTypes
 - ScopedTypeVariables
+- StandaloneDeriving
 - TemplateHaskell
 - TupleSections
 - UndecidableInstances
