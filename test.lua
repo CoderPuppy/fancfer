@@ -857,7 +857,7 @@ end
 function realize(ref, dir, name, opts)
 	ref = assert(flesh(ref), 'TODO')
 	assert(not ref.real, 'TODO')
-	if not filter(ref, dir, name) then
+	if not opts.filter(ref, dir, name) then
 		realize_pending_file(ref, dir, name, opts)
 		if ffi.C.symlinkat('.fancfer-unrealized/' .. ref.short.hash, ffi.C.dirfd(dir), name) == -1 then cerror() end
 	elseif ref.short.type == 'src' then
