@@ -159,6 +159,7 @@ ffi.cdef [[
 	};
 	int renameat2(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, enum renameat2_flags flags);
 	int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, enum at_flags flags);
+	int unlinkat(int dirfd, const char *pathname, enum at_flags flags);
 	int mkdirat(int dirfd, const char *pathname, enum mode mode);
 
 	int64_t llistxattr(const char *path, char *list, size_t size);
@@ -243,6 +244,21 @@ local function readlinkat(dirfd, name)
 	end
 	return ffi.string(buf, size)
 end
+local function ensuredirat(dirfd, name, flags, mode)
+	while true do
+		local fd = ffi.C.openat(dirfd, name, flags, 0)
+		if fd == -1 then
+			local errno = ffi.errno()
+			if errno == ffi.C.ENOENT then
+				if ffi.C.mkdirat(dirfd, name, mode) == -1 then cerror() end
+			else
+				cerror()
+			end
+		else
+			return fd
+		end
+	end
+end
 
 local cwd = ffi.string(ffi.gc(ffi.C.get_current_dir_name(), ffi.C.free))
 local root = ffi.gc(ffi.C.fdopendir(ffi.C.openat(-100, cwd, ffi.C.O_PATH, 0)), ffi.C.closedir)
@@ -290,9 +306,7 @@ local function add_object_build(obj_type)
 			if not len then len = #data end
 			hasher(data, len)
 			local wr_len = ffi.C.fwrite(data, 1, len, f)
-			if wr_len ~= len then
-				error 'TODO'
-			end
+			assert(wr_len == len, 'ASSUME wr_len == len')
 			return pump
 		else
 			local hash = hasher()
@@ -390,16 +404,10 @@ local function retrieve_src(h)
 	line[0] = nil
 	line_cap[0] = 0
 	len = ffi.C.getdelim(line, line_cap, 0, h)
-	if len == -1 then
-		ffi.C.free(line[0])
-		error 'TODO'
-	end
+	assert(len ~= -1, 'ASSUME src object has type')
 	local src_type = ffi.string(line[0], len - 1)
 	len = ffi.C.getdelim(line, line_cap, 0, h)
-	if len == -1 then
-		ffi.C.free(line[0])
-		error 'TODO'
-	end
+	assert(len ~= -1, 'ASSUME src object has arg')
 	local arg = ffi.string(line[0], len - 1)
 	ffi.C.free(line[0])
 	return src_type, arg
@@ -422,7 +430,7 @@ local test_ref = { short = {
 	from = nil;
 }; }
 
-local flesh, src_arg, src_view, head, fake_head, list, backpath
+local flesh, src_arg, src_view, head, fake_head, list
 local function flesh_real_srcs(ref, srcs_fd)
 	if srcs_fd == -1 then
 		local errno = ffi.errno()
@@ -540,6 +548,9 @@ function flesh(ref)
 				end
 			end
 			error(('TODO: target = %q'):format(target))
+		elseif ft == ffi.C.S_IFREG then
+			ref.short.type = 'blob'
+			return orig_ref
 		else
 			error(('TODO: ft == %06o'):format(ft))
 		end
@@ -687,7 +698,7 @@ function list(ref)
 		end
 	end
 end
-function backpath(ref, pick)
+local function backpath(ref, pick)
 	local backpath = {}
 	local n = 0
 	local short, ext_i, ext = ref.short, ref.ext_i, ref.ext
@@ -716,6 +727,31 @@ function backpath(ref, pick)
 	end
 	backpath.n = n
 	return backpath
+end
+local function backpath_iter(ref, pick)
+	return function(pick, st)
+		if st.ext_i == 0 then
+			if pick(st) then
+				return st.ext.ref, st.ext
+			else
+				return {
+					short = st.short;
+					ext_i = st.ext.ext_i;
+					ext = st.ext.ext;
+				}, st.ext
+			end
+		else
+			if st.short.from then
+				return {
+					short = st.short.from.ref_short;
+					ext_i = st.ext_i and st.ext_i - 1 or nil;
+					ext = st.ext;
+				}, st.short.from
+			else
+				return nil
+			end
+		end
+	end, pick, ref
 end
 local function path_str(path, step)
 	local start, stop
@@ -751,47 +787,47 @@ local function path_str(path, step)
 	return table.concat(parts)
 end
 local realize, realize_pending_dir, realize_pending_file
-function realize_pending_dir(ref, handle, filter)
-	local ext_i, ext = ref.ext_i, ref.ext
+function realize_find_pending(ref)
 	local srcs = {}
 	local srcs_n = 0
-	while ext_i == 0 do
-		assert(ext.type == 'src_val', 'TODO')
-		srcs_n = srcs_n + 1
-		srcs[srcs_n] = ext.ref
-		ext_i = ext.ext_i
-		ext = ext.ext
+	local in_src_arg
+	for up_ref, part in backpath_iter(ref, function() return true end) do
+		if part.type == 'src_val' then
+			srcs_n = srcs_n + 1
+			srcs[srcs_n] = up_ref
+		elseif part.type == 'src_arg' then
+			in_src_arg = up_ref
+		elseif part.type == 'dir' then
+			break
+		elseif part.type == 'unrealized' then
+		else
+			error(('TODO: part.type == %q'):format(part.type))
+		end
 	end
-	local in_src_arg = ref.short.from and ref.short.from.type == 'src_arg' and ref.short.from.ref_short
-	if srcs_n > 0 then
+	srcs.n = srcs_n
+	return srcs, in_src_arg
+end
+function realize_pending_dir(ref, handle, opts)
+	local srcs, in_src_arg = realize_find_pending(ref)
+	if srcs.n > 0 then
 		if ffi.C.mkdirat(ffi.C.dirfd(handle), '.fancfer-srcs', normal_dir_mode) == -1 then cerror() end
 		local srcs_fd = ffi.C.openat(ffi.C.dirfd(handle), '.fancfer-srcs', ffi.C.O_DIRECTORY, 0)
 		if srcs_fd == -1 then cerror() end
 		local srcs_dir = ffi.gc(ffi.C.fdopendir(srcs_fd), ffi.C.closedir)
-		local digits = #tostring(srcs_n)
-		for i = srcs_n, 1, -1 do
-			assert(not srcs[i].short.real, 'TODO')
-			realize(src_arg(srcs[i]), srcs_dir, ('%%0%dd'):format(digits):format(srcs_n - i + 1), filter)
+		local digits = #tostring(srcs.n)
+		for i = srcs.n, 1, -1 do
+			assert(not srcs[i].short.real or srcs[i].short.src_in_dir, 'TODO')
+			realize(src_arg(srcs[i]), srcs_dir, ('%%0%dd'):format(digits):format(srcs.n - i + 1), opts)
 		end
 	end
 	if in_src_arg then
-		if ffi.C.fsetxattr(ffi.C.dirfd(handle), 'user.fancfer.source-type', in_src_arg.src_type, #in_src_arg.src_type, ffi.C.XATTR_CREATE) == -1 then cerror() end
+		if ffi.C.fsetxattr(ffi.C.dirfd(handle), 'user.fancfer.source-type', in_src_arg.short.src_type, #in_src_arg.short.src_type, ffi.C.XATTR_CREATE) == -1 then cerror() end
 	end
 end
-function realize_pending_file(ref, dir, name, filter)
-	local ext_i, ext = ref.ext_i, ref.ext
-	local srcs = {}
-	local srcs_n = 0
-	while ext_i == 0 do
-		assert(ext.type == 'src_val', 'TODO')
-		srcs_n = srcs_n + 1
-		srcs[srcs_n] = ext.ref
-		ext_i = ext.ext_i
-		ext = ext.ext
-	end
-	local in_src_arg = ref.short.from and ref.short.from.type == 'src_arg' and ref.short.from.ref_short
+function realize_pending_file(ref, dir, name, opts)
+	local srcs, in_src_arg = realize_find_pending(ref)
 	local srcs_dir
-	if srcs_n > 0 or in_src_arg then
+	if srcs.n > 0 or in_src_arg then
 		if ffi.C.mkdirat(ffi.C.dirfd(dir), '.fancfer-ssrcs', normal_dir_mode) == -1 then
 			local errno = ffi.errno()
 			if errno == ffi.C.EEXIST then
@@ -807,48 +843,57 @@ function realize_pending_file(ref, dir, name, filter)
 		if srcs_fd == -1 then cerror() end
 		srcs_dir = ffi.gc(ffi.C.fdopendir(srcs_fd), ffi.C.closedir)
 	end
-	if srcs_n > 0 then
-		local digits = #tostring(srcs_n)
-		for i = srcs_n, 1, -1 do
+	if srcs.n > 0 then
+		local digits = #tostring(srcs.n)
+		for i = srcs.n, 1, -1 do
 			assert(not srcs[i].short.real, 'TODO')
-			realize(src_arg(srcs[i]), srcs_dir, ('%%0%dd'):format(digits):format(srcs_n - i + 1), filter)
+			realize(src_arg(srcs[i]), srcs_dir, ('%%0%dd'):format(digits):format(srcs.n - i + 1), opts)
 		end
 	end
 	if in_src_arg then
-		if ffi.C.fsetxattr(ffi.C.dirfd(srcs_dir), 'user.fancfer.source-type', in_src_arg.src_type, #in_src_arg.src_type, ffi.C.XATTR_CREATE) == -1 then cerror() end
+		if ffi.C.fsetxattr(ffi.C.dirfd(srcs_dir), 'user.fancfer.source-type', in_src_arg.short.src_type, #in_src_arg.short.src_type, ffi.C.XATTR_CREATE) == -1 then cerror() end
 	end
 end
-function realize(ref, dir, name, filter)
+function realize(ref, dir, name, opts)
 	ref = assert(flesh(ref), 'TODO')
 	assert(not ref.real, 'TODO')
 	if not filter(ref, dir, name) then
-		realize_pending_file(ref, dir, name, filter)
+		realize_pending_file(ref, dir, name, opts)
 		if ffi.C.symlinkat('.fancfer-unrealized/' .. ref.short.hash, ffi.C.dirfd(dir), name) == -1 then cerror() end
 	elseif ref.short.type == 'src' then
-		realize(src_view(ref), dir, name, filter)
+		realize(src_val(ref), dir, name, opts)
 	elseif ref.short.type == 'dir' then
 		if ffi.C.mkdirat(ffi.C.dirfd(dir), name, normal_dir_mode) == -1 then cerror() end
 		local fd = ffi.C.openat(ffi.C.dirfd(dir), name, ffi.C.O_DIRECTORY, 0)
 		if fd == -1 then cerror() end
 		local handle = ffi.gc(ffi.C.fdopendir(fd), ffi.C.closedir)
-		realize_pending_dir(ref, handle, filter)
+		realize_pending_dir(ref, handle, opts)
 		for _, name, sub_ref in list(ref) do
-			realize(sub_ref, handle, name, filter)
+			realize(sub_ref, handle, name, opts)
 		end
 	elseif ref.short.type == 'blob' then
-		realize_pending_file(ref, dir, name, filter)
+		realize_pending_file(ref, dir, name, opts)
 		local fd = ffi.C.openat(ffi.C.dirfd(dir), name, bit.bor(ffi.C.O_CREAT, ffi.C.O_WRONLY), normal_file_mode)
 		if fd == -1 then cerror() end
 		if ffi.C.ioctl(fd, ffi.C.FICLONE, ffi.cast('int', ffi.C.fileno(ref.short.handle))) == -1 then cerror() end
 		if ffi.C.close(fd) == -1 then cerror() end
+	elseif ref.short.type == 'unrealized' then
+		if ffi.C.unlinkat(ffi.C.dirfd(dir), name, 0) == -1 then cerror() end
+		realize({
+			short = ref.short.obj;
+			ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+			ext = ref.ext;
+		}, dir, name, opts)
 	else
 		error(('TODO: ref.short.type == %q'):format(ref.short.type))
 	end
 end
 
-realize(test_ref, root, 'test1', function(ref, dir, name)
-	return not (ref.short.from and ref.short.from.type == 'src_arg')
-end)
+realize(test_ref, root, 'test1', {
+	filter = function(ref, dir, name)
+		return not (ref.short.from and ref.short.from.type == 'src_arg')
+	end;
+})
 
 local root_ref = flesh { short = {
 	real = true;
