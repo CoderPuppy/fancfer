@@ -217,25 +217,23 @@ descend (PPDir name:path) = real.dirAt name._Just.descend path
 -- TODO
 
 srcLens :: (Pure f, FBackRef f, FMessage f) => SourceType -> (Value () -> f (Value ())) -> Value () -> f (Value ())
-srcLens STCommitLog = dirAt "index"._Just.real
-srcLens STBackRef = \f arg ->
-	runGet
-		(mget (real._VText.to T.unpack.to readMaybe._Just) pure arg)
-		$ \(First ns) ->
-		fmap (const arg) $ fromMaybe (pure' ()) $ do
-			(nReal, nSrc) <- ns
-			pure $ fmap (const ()) $ fBackRef
-				(\f ((), zp) -> fmap (first $ const ()) $ zipperBackRef (nReal, nSrc) f (VBackRefCycle, zp))
-				(\path v -> fmap ((),) $ f v)
-				()
-srcLens STDescend = \f arg ->
-	runGet
-		(mget (dirAt "to"._Just.real._VText.to T.unpack.to readMaybe._Just) pure arg)
-		$ \(First to) ->
-		fromMaybe (pure' arg) $ do
-			to <- to
-			-- TODO: sources in from?
-			pure $ (dirAt "from"._Just.descend to) f arg
+srcLens STCommitLog = real.dirAt "index"._Just.fakeReal
+srcLens STBackRef = \f arg -> runGet
+	(mget (real._VText.to T.unpack.to readMaybe._Just) pure arg)
+	$ \(First ns) ->
+	fmap (const arg) $ fromMaybe (pure' ()) $ do
+		(nReal, nSrc) <- ns
+		pure $ fmap (const ()) $ fBackRef
+			(\f ((), zp) -> fmap (first $ const ()) $ zipperBackRef (nReal, nSrc) f (VBackRefCycle, zp))
+			(\path v -> fmap ((),) $ f v)
+			()
+srcLens STDescend = \f arg -> runGet
+	(mget (real.dirAt "to"._Just.real._VText.to T.unpack.to readMaybe._Just) pure arg)
+	$ \(First to) ->
+	fromMaybe (pure' arg) $ do
+		to <- to
+		-- TODO: sources in from?
+		pure $ (dirAt "from"._Just.descend to) f arg
 srcLens STAutoCommit = \f currCommit -> let
 		newCommit currVal newVal msg | currVal == newVal = currCommit
 		newCommit currVal newVal msg = VDir $ M.fromList [
@@ -246,9 +244,9 @@ srcLens STAutoCommit = \f currCommit -> let
 				]
 			]
 	in runGet
-		(mget (dirAt "value"._Just) pure currCommit)
-		$ \(First currVal) ->
-		fromMaybe (pure' currCommit) $ fmap (fMessage . fmap (pure' .) . uncurry fmap . (newCommit &&& f)) currVal
+		(mget (real.dirAt "value"._Just) pure currCommit)
+		$ \(First currVal) -> fromMaybe (pure' currCommit) $
+		fmap (fMessage . fmap (pure' .) . uncurry fmap . (newCommit &&& f)) currVal
 
 srcArg :: (Pure f, FBackRef f) => (Value () -> f (Value ())) -> Source () -> f (Source ())
 srcArg f = fmap fst . fBackRef'
@@ -258,12 +256,17 @@ srcArg f = fmap fst . fBackRef'
 	(\() arg -> fmap ((),) $ f arg)
 
 srcVal :: (Pure f, FBackRef f, FMessage f) => (Value () -> f (Value ())) -> Source () -> f (Source ())
-srcVal f src@(Source st arg ()) = (srcArg . real . srcLens st) f src
+srcVal f src@(Source st arg ()) = (srcArg . fakeReal . srcLens st) f src
 
 real :: (Pure f, FBackRef f, FMessage f) => (Value () -> f (Value ())) -> Value () -> f (Value ())
 real f (VSourced s) = fmap VSourced $ (srcVal.real) f s
-real f (VFakeReal v) = fmap VFakeReal $ f v
+real f (VFakeReal v) = fmap VFakeReal $ real f v
 real f v = f v
+
+fakeReal :: (Pure f, FBackRef f, FMessage f) => (Value () -> f (Value ())) -> Value () -> f (Value ())
+fakeReal f (VSourced s) = fmap VSourced $ (srcVal.real) f s
+fakeReal f (VFakeReal v) = fmap VFakeReal $ f v
+fakeReal f v = f v
 
 dirAt :: (Pure f, FBackRef f) => T.Text -> (Maybe (Value ()) -> f (Maybe (Value ()))) -> Value () -> f (Value ())
 dirAt name = _VDir . \f -> fmap fst . fBackRef'
@@ -329,3 +332,7 @@ test_set v msg l v' = fst $ runIdentity $ ($ msg) $ runIdentity $ runRT $ flip r
 	l (const $ pure' v') v
 test_zp v l = snd $ runIdentity $ runWriterT $ runRT $ flip runStateT [] $ runFFT $ flip l v $
 	\v -> FFT $ StateT $ \zp -> RT $ tell [zp] *> pure (const $ pure (v, zp))
+
+-- TODO: coalescing updates
+-- TODO: cycle detection
+-- TODO: external state

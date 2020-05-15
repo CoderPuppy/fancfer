@@ -30,12 +30,21 @@ dependencies:
 - data-fix
 - mtl
 - transformers
+- binary
+- SHA
+- base16-bytestring
+- linux-xattr
+- unliftio
+- rio
 
 default-extensions:
 - ApplicativeDo
 - DataKinds
 - DefaultSignatures
+- DeriveAnyClass
 - DeriveFunctor
+- DeriveGeneric
+- DerivingStrategies
 - DuplicateRecordFields
 - FlexibleContexts
 - FlexibleInstances
@@ -47,13 +56,17 @@ default-extensions:
 - LambdaCase
 - MultiParamTypeClasses
 - NamedFieldPuns
+- NoImplicitPrelude
 - OverloadedLabels
 - OverloadedStrings
+- PolyKinds
 - RankNTypes
+- RecordWildCards
 - ScopedTypeVariables
 - StandaloneDeriving
 - TemplateHaskell
 - TupleSections
+- TypeApplications
 - UndecidableInstances
 - ViewPatterns
 
