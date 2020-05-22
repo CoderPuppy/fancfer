@@ -1,9 +1,10 @@
 module Fancfer.W1 where
 
-import qualified Data.Text as T
-import qualified Data.Map as M
-import qualified System.Posix as Posix
+import RIO
 import qualified Data.ByteString as BS
+import qualified Data.Map as M
+import qualified Data.Text as T
+import qualified System.Posix as Posix
 
 newtype Id = Id T.Text deriving (Show)
 

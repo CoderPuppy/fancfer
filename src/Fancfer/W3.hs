@@ -17,7 +17,7 @@ import Data.Profunctor
 import Data.Tuple
 import Debug.Trace
 import GHC.OverloadedLabels
-import Prelude hiding (id, (.))
+import RIO hiding (id, (.), lift, to)
 import Text.Read (readMaybe)
 import qualified Data.Map as M
 import qualified Data.Text as T

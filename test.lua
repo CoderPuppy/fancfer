@@ -413,23 +413,6 @@ local function retrieve_src(h)
 	return src_type, arg
 end
 
-local test_obj = add_src('commit_log', add_dir {
-		{'index', add_dir {
-			{'foo', add_blob_str 'foo1'};
-		}};
-})
--- local test_obj = add_dir {
--- 	{'wat', add_src('commit_log', add_dir {
--- 		{'index', add_blob_str 'foo1'};
--- 	})};
--- }
-
-local test_ref = { short = {
-	real = false;
-	hash = test_obj;
-	from = nil;
-}; }
-
 local flesh, src_arg, src_view, head, fake_head, list
 local function flesh_real_srcs(ref, srcs_fd)
 	if srcs_fd == -1 then
@@ -698,6 +681,13 @@ function list(ref)
 		end
 	end
 end
+function dir_at(ref, name_)
+	for _, name, sub_ref in list(ref) do
+		if name == name_ then
+			return sub_ref
+		end
+	end
+end
 local function backpath(ref, pick)
 	local backpath = {}
 	local n = 0
@@ -741,7 +731,7 @@ local function backpath_iter(ref, pick)
 				}, st.ext
 			end
 		else
-			if st.short.from then
+			if st.short and st.short.from then
 				return {
 					short = st.short.from.ref_short;
 					ext_i = st.ext_i and st.ext_i - 1 or nil;
@@ -888,16 +878,82 @@ function realize(ref, dir, name, opts)
 		error(('TODO: ref.short.type == %q'):format(ref.short.type))
 	end
 end
+local function ref_str(ref)
+	local parts = {}
+	local parts_n = 0
+	for up_ref, part in backpath_iter(ref, function() return true end) do
+		parts_n = parts_n + 1
+		local part_str
+		if part.type == 'src_arg' or part.type == 'src_val' then
+			part_str = part.type
+		elseif part.type == 'dir' then
+			part_str = 'dir:' .. part.name
+		elseif part.type == 'real_root' then
+			part_str = ('real_root(%s, %s)'):format(
+				readlinkat(-100, ('/proc/self/fd/%d'):format(ffi.C.dirfd(part.dir))),
+				part.name
+			)
+		else
+			error(('TODO: part.type == %q'):format(part.type))
+		end
+		parts[parts_n] = part_str
+	end
+	for i = 1, math.floor(parts_n/2) do
+		parts[i], parts[parts_n - i + 1] = parts[parts_n - i + 1], parts[i]
+	end
+	return table.concat(parts, '/')
+end
 
-realize(test_ref, root, 'test1', {
-	filter = function(ref, dir, name)
-		return not (ref.short.from and ref.short.from.type == 'src_arg')
-	end;
+local function copy(src, dst, opts)
+	src = assert(flesh(src), 'TODO')
+	print(ref_str(src))
+end
+
+local test_obj = add_src('commit_log', add_dir {
+	{'index', add_dir {
+		{'foo', add_blob_str 'foo1'};
+	}};
 })
+-- local test_obj = add_dir {
+-- 	{'wat', add_src('commit_log', add_dir {
+-- 		{'index', add_blob_str 'foo1'};
+-- 	})};
+-- }
+
+local test_ref = { short = {
+	real = false;
+	hash = test_obj;
+	from = {
+		type = 'virtual_root';
+		hash = test_obj;
+	};
+}; }
+
+-- realize(test_ref, root, 'test1', {
+-- 	filter = function(ref, dir, name)
+-- 		return true
+-- 		-- return not (ref.short.from and ref.short.from.type == 'src_arg')
+-- 	end;
+-- })
 
 local root_ref = flesh { short = {
 	real = true;
 	dir = root;
 	name = 'test1';
+	from = {
+		type = 'real_root';
+		dir = root;
+		name = 'test1';
+	};
 }; }
-print(pl.pretty.write(flesh(src_arg(root_ref))))
+
+copy(head(root_ref), {
+	type = 'real_root';
+	dir = root;
+	name = 'test2';
+}, {
+	filter = function(src, dst)
+		print(src, dst)
+		return true
+	end;
+})

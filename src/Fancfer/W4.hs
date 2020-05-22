@@ -9,6 +9,7 @@ import Data.Fix
 import Data.Functor.Contravariant
 import Data.Functor.Identity
 import Data.Profunctor
+import RIO
 
 class Functor f => Pure f where
 	pure' :: a -> f a
