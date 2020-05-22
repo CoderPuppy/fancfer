@@ -1,2 +1,7 @@
 renameat2 with RENAME_EXCHANGE
 patch based thing, see Pijul
+location tracking, see git-annex
+split information between drives
+filesystem help for keeping the "index" up to date, see VFSforGit and Scalar
+content aware chunking
+tree based hashing: see Blake3
