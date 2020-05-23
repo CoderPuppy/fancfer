@@ -501,7 +501,14 @@ function flesh(ref)
 		local stat = ffi.new('struct statx[1]')
 		if ffi.C.statx(ffi.C.dirfd(ref.short.dir), ref.short.name, ffi.C.AT_SYMLINK_NOFOLLOW, bit.bor(
 			ffi.C.STATX_ALL -- TODO
-		), stat) == -1 then cerror() end
+		), stat) == -1 then
+			local errno = ffi.errno()
+			if errno == ffi.C.ENOENT then
+				return nil
+			else
+				cerror()
+			end
+		end
 		local ft = bit.band(stat[0].stx_mode, ffi.C.S_IFMT)
 		local orig_ref = ref
 		ref = flesh_real_srcs(ref, ffi.C.openat(ffi.C.dirfd(ref.short.dir), '.fancfer-ssrcs/' .. ref.short.name, ffi.C.O_DIRECTORY, 0))
@@ -790,6 +797,7 @@ function realize_find_pending(ref)
 		elseif part.type == 'dir' then
 			break
 		elseif part.type == 'unrealized' then
+		elseif part.type == 'virtual_root' then
 		else
 			error(('TODO: part.type == %q'):format(part.type))
 		end
@@ -903,9 +911,25 @@ local function ref_str(ref)
 	end
 	return table.concat(parts, '/')
 end
+local function flesh_place(place)
+	if place.short.type == 'real_root' then
+		place.short.ref = flesh {
+			short = {
+				real = true;
+				dir = place.short.dir;
+				name = place.short.name;
+				from = place.short;
+			};
+		}
+		return place
+	else
+		error(('TODO: place.type == %q'):format(place.type))
+	end
+end
 
 local function copy(src, dst, opts)
 	src = assert(flesh(src), 'TODO')
+	dst = assert(flesh_place(dst), 'TODO')
 	print(ref_str(src))
 end
 
@@ -914,7 +938,7 @@ local test_obj = add_src('commit_log', add_dir {
 		{'foo', add_blob_str 'foo1'};
 	}};
 })
--- local test_obj = add_dir {
+-- local test_obj = add_diror {
 -- 	{'wat', add_src('commit_log', add_dir {
 -- 		{'index', add_blob_str 'foo1'};
 -- 	})};
@@ -929,12 +953,12 @@ local test_ref = { short = {
 	};
 }; }
 
--- realize(test_ref, root, 'test1', {
--- 	filter = function(ref, dir, name)
--- 		return true
--- 		-- return not (ref.short.from and ref.short.from.type == 'src_arg')
--- 	end;
--- })
+realize(test_ref, root, 'test1', {
+	filter = function(ref, dir, name)
+		return true
+		-- return not (ref.short.from and ref.short.from.type == 'src_arg')
+	end;
+})
 
 local root_ref = flesh { short = {
 	real = true;
@@ -947,11 +971,13 @@ local root_ref = flesh { short = {
 	};
 }; }
 
-copy(head(root_ref), {
+local root2_place = { short = {
 	type = 'real_root';
 	dir = root;
 	name = 'test2';
-}, {
+}; }
+
+copy(head(root_ref), root2_place, {
 	filter = function(src, dst)
 		print(src, dst)
 		return true
