@@ -260,495 +260,597 @@ local function ensuredirat(dirfd, name, flags, mode)
 	end
 end
 
+local function otyp(o)
+	for k in pairs(o) do
+		if type(k) == 'table' then
+			return k
+		end
+	end
+end
+
 local cwd = ffi.string(ffi.gc(ffi.C.get_current_dir_name(), ffi.C.free))
 local root = ffi.gc(ffi.C.fdopendir(ffi.C.openat(-100, cwd, ffi.C.O_PATH, 0)), ffi.C.closedir)
 local repo = ffi.gc(ffi.C.fdopendir(ffi.C.openat(ffi.C.dirfd(root), '.fancfer', ffi.C.O_PATH, 0)), ffi.C.closedir)
-local sha256_store = ffi.gc(ffi.C.fdopendir(ffi.C.openat(ffi.C.dirfd(repo), 'store/sha256', ffi.C.O_PATH, 0)), ffi.C.closedir)
 
-local function add_blob_fd(inp)
-	local tmp = ffi.C.openat(ffi.C.dirfd(repo), 'store/sha256', bit.bor(ffi.C.O_TMPFILE, ffi.C.O_RDWR), normal_file_mode)
-	if tmp == -1 then cerror() end
-	if ffi.C.ioctl(tmp, ffi.C.FICLONE, ffi.cast('int', inp)) == -1 then cerror() end
+local store_sha256 = {}; do
+	store_sha256.dir = ffi.gc(ffi.C.fdopendir(ffi.C.openat(ffi.C.dirfd(repo), 'store/sha256', ffi.C.O_PATH, 0)), ffi.C.closedir)
+	function store_sha256.add_blob_fd(inp)
+		local tmp = ffi.C.openat(ffi.C.dirfd(repo), 'store/sha256', bit.bor(ffi.C.O_TMPFILE, ffi.C.O_RDWR), normal_file_mode)
+		if tmp == -1 then cerror() end
+		if ffi.C.ioctl(tmp, ffi.C.FICLONE, ffi.cast('int', inp)) == -1 then cerror() end
 
-	local f = ffi.C.fdopen(tmp, 'r')
-	local hasher = sha256()
-	hasher('blob\0')
-	while true do
-		local len = ffi.C.fread(buf, 1, ffi.sizeof(buf), f)
-		if len == 0 then break end
-		hasher(buf, len)
-	end
-	local hash = hasher()
-
-	if ffi.C.fsetxattr(tmp, 'user.fancfer.object-type', 'blob', 4, ffi.C.XATTR_CREATE) == -1 then cerror() end
-	if ffi.C.linkat(-100, ('/proc/self/fd/%d'):format(tmp), sha256_store, hash, ffi.C.AT_SYMLINK_FOLLOW) == -1 then
-		local errno = ffi.errno()
-		if errno == ffi.C.EEXIST then
-		else
-			cerror()
+		local f = ffi.C.fdopen(tmp, 'r')
+		local hasher = sha256()
+		hasher('blob\0')
+		while true do
+			local len = ffi.C.fread(buf, 1, ffi.sizeof(buf), f)
+			if len == 0 then break end
+			hasher(buf, len)
 		end
-	end
+		local hash = hasher()
 
-	ffi.C.fclose(f)
-
-	return hash
-end
-local function add_object_build(obj_type)
-	local tmp = ffi.C.openat(ffi.C.dirfd(repo), 'store/sha256', bit.bor(ffi.C.O_TMPFILE, ffi.C.O_RDWR), normal_file_mode)
-	if tmp == -1 then cerror() end
-
-	local f = ffi.C.fdopen(tmp, 'w')
-	local hasher = sha256()
-	hasher(('%s\0'):format(obj_type))
-
-	local function pump(data, len)
-		if data then
-			if not len then len = #data end
-			hasher(data, len)
-			local wr_len = ffi.C.fwrite(data, 1, len, f)
-			assert(wr_len == len, 'ASSUME wr_len == len')
-			return pump
-		else
-			local hash = hasher()
-
-			if ffi.C.fsetxattr(tmp, 'user.fancfer.object-type', obj_type, #obj_type, ffi.C.XATTR_CREATE) == -1 then cerror() end
-			if ffi.C.linkat(-100, ('/proc/self/fd/%d'):format(tmp), ffi.C.dirfd(sha256_store), hash, ffi.C.AT_SYMLINK_FOLLOW) == -1 then
-				local errno = ffi.errno()
-				if errno == ffi.C.EEXIST then
-				else
-					cerror()
-				end
-			end
-
-			ffi.C.fclose(f)
-
-			return hash
-		end
-	end
-
-	return pump
-end
-local function add_blob_str(str)
-	return add_object_build 'blob' (str) ()
-end
-local function add_dir(entries)
-	table.sort(entries, function(a, b)
-		print(a, b)
-		return a[1] < b[1]
-	end)
-	local builder = add_object_build 'dir'
-	for i = 1, #entries do
-		builder(entries[i][2]) '\0'
-		builder(entries[i][1]) '\0'
-	end
-	return builder()
-end
-local function add_src(src_type, arg)
-	return add_object_build 'src' (src_type) '\0' (arg) '\0' ()
-end
-
-local function retrieve_object(hash)
-	local fd = ffi.C.openat(ffi.C.dirfd(sha256_store), hash, ffi.C.O_RDONLY, 0)
-	if fd == -1 then
-		local errno = ffi.errno()
-		if errno == ffi.C.ENOENT then
-			return nil
-		else
-			cerror(errno)
-		end
-	end
-	return ffi.gc(ffi.C.fdopen(fd, 'r'), ffi.C.fclose)
-end
-local function obj_type(h)
-	return fgetxattr(ffi.C.fileno(h), 'user.fancfer.object-type')
-end
-local function retrieve_dir(h)
-	if not h then return end
-	do
-		local ot = obj_type(h)
-		if ot ~= 'dir' then
-			error(('not a directory (actual type: %s)'):format(ot))
-		end
-	end
-	local line, line_cap = ffi.new('char*[1]'), ffi.new('size_t[1]')
-	line[0] = nil
-	line_cap[0] = 0
-	return function(_, place)
-		place = place or 0
-		ffi.C.fseek(h, place, ffi.C.SEEK_SET)
-		local len
-		len = ffi.C.getdelim(line, line_cap, 0, h)
-		if len == -1 then
-			ffi.C.free(line[0])
-			return nil
-		end
-		local hash = ffi.string(line[0], len - 1)
-		len = ffi.C.getdelim(line, line_cap, 0, h)
-		if len == -1 then
-			error 'TODO: invalid directory'
-		end
-		local name = ffi.string(line[0], len - 1)
-		return ffi.C.ftell(h), name, hash
-	end
-end
-local function retrieve_src(h)
-	if not h then return end
-	do
-		local ot = obj_type(h)
-		if ot ~= 'src' then
-			error(('not a source (actual type: %s)'):format(ot))
-		end
-	end
-	-- TODO: this is a terrible format
-	local line, line_cap, len = ffi.new('char*[1]'), ffi.new('size_t[1]')
-	line[0] = nil
-	line_cap[0] = 0
-	len = ffi.C.getdelim(line, line_cap, 0, h)
-	assert(len ~= -1, 'ASSUME src object has type')
-	local src_type = ffi.string(line[0], len - 1)
-	len = ffi.C.getdelim(line, line_cap, 0, h)
-	assert(len ~= -1, 'ASSUME src object has arg')
-	local arg = ffi.string(line[0], len - 1)
-	ffi.C.free(line[0])
-	return src_type, arg
-end
-
-local flesh, src_arg, src_view, head, fake_head, list
-local function flesh_real_srcs(ref, srcs_fd)
-	if srcs_fd == -1 then
-		local errno = ffi.errno()
-		if errno == ffi.C.ENOENT then
-		else
-			cerror()
-		end
-	else
-		local srcs_dir = ffi.gc(ffi.C.fdopendir(srcs_fd), ffi.C.closedir)
-		local srcs_ssrcs_fd = ffi.C.openat(srcs_fd, '.fancfer-ssrcs', ffi.C.O_DIRECTORY, 0)
-		local srcs_ssrcs_dir
-		if srcs_ssrcs_fd == -1 then
+		if ffi.C.fsetxattr(tmp, 'user.fancfer.object-type', 'blob', 4, ffi.C.XATTR_CREATE) == -1 then cerror() end
+		if ffi.C.linkat(-100, ('/proc/self/fd/%d'):format(tmp), store_sha256.dir, hash, ffi.C.AT_SYMLINK_FOLLOW) == -1 then
 			local errno = ffi.errno()
-			if errno == ffi.C.ENOENT then
+			if errno == ffi.C.EEXIST then
 			else
 				cerror()
 			end
-		else
-			srcs_ssrcs_dir = ffi.gc(ffi.C.fdopendir(srcs_ssrcs_fd), ffi.C.closedir)
 		end
-		local src_names = {}
-		local srcs_n = 0
-		while true do
-			local dirent = ffi.C.readdir(srcs_dir)
-			if dirent == nil then break end
-			local name = ffi.string(dirent.d_name)
-			if name ~= '.' and name ~= '..' and name ~= '.fancfer-srcs' and name ~= '.fancfer-ssrcs' then
-				srcs_n = srcs_n + 1
-				src_names[srcs_n] = name
-			end
-		end
-		table.sort(src_names)
-		for i = srcs_n, 1, -1 do
-			local name = src_names[i]
-			local src_fd = ffi.C.openat(srcs_fd, name, ffi.C.O_DIRECTORY, 0)
-			local src_type
-			if src_fd == -1 then
-				local errno = ffi.errno()
-				if errno == ffi.C.ENOENT then
-					if not srcs_ssrcs_dir then
-						error 'TODO'
-					end
-					src_fd = ffi.C.openat(srcs_ssrcs_fd, name, ffi.C.O_DIRECTORY, 0)
-					if src_fd == -1 then cerror() end
-				else
-					cerror()
-				end
-			end
-			src_type = fgetxattr(src_fd, 'user.fancfer.source-type')
-			if ffi.C.close(src_fd) == -1 then cerror() end
-			ref.short.type = 'src'
-			ref.short.src_type = src_type
-			ref.short.src_in_dir = true
-			ref.short.arg = {
-				real = true;
-				dir = srcs_dir;
-				name = name;
-				from = {
-					type = 'src_arg';
-					ref_short = ref.short;
-				};
-			}
-			ref.short.val = {
-				short = {
-					real = true;
-					dir = ref.short.dir;
-					name = ref.short.name;
-					from = {
-						type = 'src_val';
-						view = false;
-						ref_short = ref.short;
-					};
-				};
-				ext_i = ref.ext_i and ref.ext_i + 1 or nil;
-				ext = ref.ext;
-			}
-			ref = ref.short.val
-		end
+
+		ffi.C.fclose(f)
+
+		return hash
 	end
-	return ref
-end
-function flesh(ref)
-	if ref.short.real then
-		if ref.short.type then return ref end
-		local stat = ffi.new('struct statx[1]')
-		if ffi.C.statx(ffi.C.dirfd(ref.short.dir), ref.short.name, ffi.C.AT_SYMLINK_NOFOLLOW, bit.bor(
-			ffi.C.STATX_ALL -- TODO
-		), stat) == -1 then
+	function store_sha256.add_object_build(obj_type)
+		local tmp = ffi.C.openat(ffi.C.dirfd(repo), 'store/sha256', bit.bor(ffi.C.O_TMPFILE, ffi.C.O_RDWR), normal_file_mode)
+		if tmp == -1 then cerror() end
+
+		local f = ffi.C.fdopen(tmp, 'w')
+		local hasher = sha256()
+		hasher(('%s\0'):format(obj_type))
+
+		local function pump(data, len)
+			if data then
+				if not len then len = #data end
+				hasher(data, len)
+				local wr_len = ffi.C.fwrite(data, 1, len, f)
+				assert(wr_len == len, 'ASSUME wr_len == len')
+				return pump
+			else
+				local hash = hasher()
+
+				if ffi.C.fsetxattr(tmp, 'user.fancfer.object-type', obj_type, #obj_type, ffi.C.XATTR_CREATE) == -1 then cerror() end
+				if ffi.C.linkat(-100, ('/proc/self/fd/%d'):format(tmp), ffi.C.dirfd(store_sha256.dir), hash, ffi.C.AT_SYMLINK_FOLLOW) == -1 then
+					local errno = ffi.errno()
+					if errno == ffi.C.EEXIST then
+					else
+						cerror()
+					end
+				end
+
+				ffi.C.fclose(f)
+
+				return hash
+			end
+		end
+
+		return pump
+	end
+	function store_sha256.add_blob_str(str)
+		return store_sha256.add_object_build 'blob' (str) ()
+	end
+	function store_sha256.add_dir(entries)
+		table.sort(entries, function(a, b)
+			return a[1] < b[1]
+		end)
+		local builder = store_sha256.add_object_build 'dir'
+		for i = 1, #entries do
+			builder(entries[i][2]) '\0'
+			builder(entries[i][1]) '\0'
+		end
+		return builder()
+	end
+	function store_sha256.add_src(src_type, arg)
+		return store_sha256.add_object_build 'src' (src_type) '\0' (arg) '\0' ()
+	end
+
+	function store_sha256.retrieve_object(hash)
+		local fd = ffi.C.openat(ffi.C.dirfd(store_sha256.dir), hash, ffi.C.O_RDONLY, 0)
+		if fd == -1 then
 			local errno = ffi.errno()
 			if errno == ffi.C.ENOENT then
 				return nil
 			else
+				cerror(errno)
+			end
+		end
+		return ffi.gc(ffi.C.fdopen(fd, 'r'), ffi.C.fclose)
+	end
+	function store_sha256.obj_type(h)
+		return fgetxattr(ffi.C.fileno(h), 'user.fancfer.object-type')
+	end
+	function store_sha256.retrieve_dir(h)
+		if not h then return end
+		do
+			local ot = store_sha256.obj_type(h)
+			if ot ~= 'dir' then
+				error(('not a directory (actual type: %s)'):format(ot))
+			end
+		end
+		local line, line_cap = ffi.new('char*[1]'), ffi.new('size_t[1]')
+		line[0] = nil
+		line_cap[0] = 0
+		return function(_, place)
+			place = place or 0
+			ffi.C.fseek(h, place, ffi.C.SEEK_SET)
+			local len
+			len = ffi.C.getdelim(line, line_cap, 0, h)
+			if len == -1 then
+				ffi.C.free(line[0])
+				return nil
+			end
+			local hash = ffi.string(line[0], len - 1)
+			len = ffi.C.getdelim(line, line_cap, 0, h)
+			if len == -1 then
+				error 'TODO: invalid directory'
+			end
+			local name = ffi.string(line[0], len - 1)
+			return ffi.C.ftell(h), name, hash
+		end
+	end
+	function store_sha256.retrieve_src(h)
+		if not h then return end
+		do
+			local ot = store_sha256.obj_type(h)
+			if ot ~= 'src' then
+				error(('not a source (actual type: %s)'):format(ot))
+			end
+		end
+		-- TODO: this is a terrible format
+		local line, line_cap, len = ffi.new('char*[1]'), ffi.new('size_t[1]')
+		line[0] = nil
+		line_cap[0] = 0
+		len = ffi.C.getdelim(line, line_cap, 0, h)
+		assert(len ~= -1, 'ASSUME src object has type')
+		local src_type = ffi.string(line[0], len - 1)
+		len = ffi.C.getdelim(line, line_cap, 0, h)
+		assert(len ~= -1, 'ASSUME src object has arg')
+		local arg = ffi.string(line[0], len - 1)
+		ffi.C.free(line[0])
+		return src_type, arg
+	end
+end
+
+local Ref, Place = {}, {}
+do -- Ref
+	Ref.short = {name = 'ref_short';}
+	Ref.long = {name = 'ref_long';}
+	local function flesh_real_srcs(ref, srcs_fd)
+		if srcs_fd == -1 then
+			local errno = ffi.errno()
+			if errno == ffi.C.ENOENT then
+			else
 				cerror()
 			end
-		end
-		local ft = bit.band(stat[0].stx_mode, ffi.C.S_IFMT)
-		local orig_ref = ref
-		ref = flesh_real_srcs(ref, ffi.C.openat(ffi.C.dirfd(ref.short.dir), '.fancfer-ssrcs/' .. ref.short.name, ffi.C.O_DIRECTORY, 0))
-		if ft == ffi.C.S_IFDIR then
-			local fd = ffi.C.openat(ffi.C.dirfd(ref.short.dir), ref.short.name, ffi.C.O_DIRECTORY, 0)
-			if fd == -1 then cerror() end
-			ref = flesh_real_srcs(ref, ffi.C.openat(fd, '.fancfer-srcs', ffi.C.O_DIRECTORY, 0))
-			ref.short.type = 'dir'
-			ref.short.handle = ffi.gc(ffi.C.fdopendir(fd), ffi.C.closedir)
-			return orig_ref
-		elseif ft == ffi.C.S_IFLNK then
-			local target = readlinkat(ffi.C.dirfd(ref.short.dir), ref.short.name)
-
-			do
-				local hash = target:match('^%.fancfer%-unrealized/(' .. ('[0-9a-f]'):rep(64) .. ')$')
-				if hash then
-					ref.short.type = 'unrealized'
-					ref.short.obj = {
-						real = false;
-						hash = hash;
-						from = {
-							type = 'unrealized';
-							ref_short = ref.short;
-						};
-					}
-					return orig_ref
+		else
+			local srcs_dir = ffi.gc(ffi.C.fdopendir(srcs_fd), ffi.C.closedir)
+			local srcs_ssrcs_fd = ffi.C.openat(srcs_fd, '.fancfer-ssrcs', ffi.C.O_DIRECTORY, 0)
+			local srcs_ssrcs_dir
+			if srcs_ssrcs_fd == -1 then
+				local errno = ffi.errno()
+				if errno == ffi.C.ENOENT then
+				else
+					cerror()
+				end
+			else
+				srcs_ssrcs_dir = ffi.gc(ffi.C.fdopendir(srcs_ssrcs_fd), ffi.C.closedir)
+			end
+			local src_names = {}
+			local srcs_n = 0
+			while true do
+				local dirent = ffi.C.readdir(srcs_dir)
+				if dirent == nil then break end
+				local name = ffi.string(dirent.d_name)
+				if name ~= '.' and name ~= '..' and name ~= '.fancfer-srcs' and name ~= '.fancfer-ssrcs' then
+					srcs_n = srcs_n + 1
+					src_names[srcs_n] = name
 				end
 			end
-			error(('TODO: target = %q'):format(target))
-		elseif ft == ffi.C.S_IFREG then
-			ref.short.type = 'blob'
-			return orig_ref
-		else
-			error(('TODO: ft == %06o'):format(ft))
-		end
-	else
-		if not ref.short.handle then
-			local h = retrieve_object(ref.short.hash)
-			assert(h, 'TODO')
-			ref.short.handle = h
-			ref.short.type = obj_type(h)
-			if ref.short.type == 'src' then
-				local arg
-				ref.short.src_type, arg = retrieve_src(h)
+			table.sort(src_names)
+			for i = srcs_n, 1, -1 do
+				local name = src_names[i]
+				local src_fd = ffi.C.openat(srcs_fd, name, ffi.C.O_DIRECTORY, 0)
+				local src_type
+				if src_fd == -1 then
+					local errno = ffi.errno()
+					if errno == ffi.C.ENOENT then
+						if not srcs_ssrcs_dir then
+							error 'TODO'
+						end
+						src_fd = ffi.C.openat(srcs_ssrcs_fd, name, ffi.C.O_DIRECTORY, 0)
+						if src_fd == -1 then cerror() end
+					else
+						cerror()
+					end
+				end
+				src_type = fgetxattr(src_fd, 'user.fancfer.source-type')
+				if ffi.C.close(src_fd) == -1 then cerror() end
+				ref.short.type = 'src'
+				ref.short.src_type = src_type
+				ref.short.src_in_dir = true
 				ref.short.arg = {
-					real = false;
-					hash = arg;
-					from = {
-						type = 'src_arg';
-						ref_short = ref.short;
+					[Place.short] = true;
+					type = 'src_arg';
+					from = ref.short;
+				}
+				ref.short.arg.ref = {
+					[Ref.long] = true;
+					short = {
+						[Ref.short] = true;
+						real = true;
+						dir = srcs_dir;
+						name = name;
+						from = ref.short.arg;
 					};
 				}
+				ref.short.val = {
+					[Place.short] = true;
+					type = 'src_val';
+					view = false;
+					from = ref.short;
+				}
+				ref.short.val.ref = {
+					[Ref.long] = true;
+					short = {
+						[Ref.short] = true;
+						real = true;
+						dir = ref.short.dir;
+						name = ref.short.name;
+						from = ref.short.val;
+					};
+				}
+				ref = ref.short.val.ref
 			end
 		end
 		return ref
 	end
-end
-function src_arg(ref)
-	ref = assert(flesh(ref), 'TODO')
-	if ref.short.type ~= 'src' then
-		error(('not a source (actual type: %s)'):format(ref.short.type))
+	function Ref.flesh(ref)
+		assert(ref[Ref.long], 'not a long reference')
+		if ref.short.real then
+			if ref.short.type then return ref end
+			local stat = ffi.new('struct statx[1]')
+			if ffi.C.statx(ffi.C.dirfd(ref.short.dir), ref.short.name, ffi.C.AT_SYMLINK_NOFOLLOW, bit.bor(
+				ffi.C.STATX_ALL -- TODO
+			), stat) == -1 then
+				local errno = ffi.errno()
+				if errno == ffi.C.ENOENT then
+					return nil
+				else
+					cerror()
+				end
+			end
+			local ft = bit.band(stat[0].stx_mode, ffi.C.S_IFMT)
+			local orig_ref = ref
+			ref = flesh_real_srcs(ref, ffi.C.openat(ffi.C.dirfd(ref.short.dir), '.fancfer-ssrcs/' .. ref.short.name, ffi.C.O_DIRECTORY, 0))
+			if ft == ffi.C.S_IFDIR then
+				local fd = ffi.C.openat(ffi.C.dirfd(ref.short.dir), ref.short.name, ffi.C.O_DIRECTORY, 0)
+				if fd == -1 then cerror() end
+				ref = flesh_real_srcs(ref, ffi.C.openat(fd, '.fancfer-srcs', ffi.C.O_DIRECTORY, 0))
+				ref.short.type = 'dir'
+				ref.short.handle = ffi.gc(ffi.C.fdopendir(fd), ffi.C.closedir)
+				return orig_ref
+			elseif ft == ffi.C.S_IFLNK then
+				local target = readlinkat(ffi.C.dirfd(ref.short.dir), ref.short.name)
+
+				do
+					local hash = target:match('^%.fancfer%-unrealized/(' .. ('[0-9a-f]'):rep(64) .. ')$')
+					if hash then
+						ref.short.type = 'unrealized'
+						ref.short.obj = {
+							[Ref.short] = true;
+							real = false;
+							hash = hash;
+							from = {
+								[Place.short] = true;
+								type = 'unrealized';
+								from = ref.short;
+							};
+						}
+						return orig_ref
+					end
+				end
+				error(('TODO: target = %q'):format(target))
+			elseif ft == ffi.C.S_IFREG then
+				ref.short.type = 'blob'
+				return orig_ref
+			else
+				error(('TODO: ft == %06o'):format(ft))
+			end
+		else
+			if not ref.short.handle then
+				local h = store_sha256.retrieve_object(ref.short.hash)
+				assert(h, 'TODO')
+				ref.short.handle = h
+				ref.short.type = store_sha256.obj_type(h)
+				if ref.short.type == 'src' then
+					local arg
+					ref.short.src_type, arg = store_sha256.retrieve_src(h)
+					ref.short.arg = {
+						[Ref.short] = true;
+						real = false;
+						hash = arg;
+						from = {
+							[Place.short] = true;
+							type = 'src_arg';
+							from = ref.short;
+						};
+					}
+				end
+			end
+			return ref
+		end
 	end
-	return {
-		short = ref.short.arg;
-		ext_i = ref.ext_i and ref.ext_i + 1 or nil;
-		ext = ref.ext;
-	}
-end
-function src_view(ref)
-	ref = assert(flesh(ref), 'TODO')
-	if ref.short.type ~= 'src' then
-		error(('not a source (actual type: %s)'):format(ref.short.type))
+	function Ref.src_arg(ref)
+		assert(ref[Ref.long], 'not a long reference')
+		ref = assert(Ref.flesh(ref), 'TODO')
+		if ref.short.type ~= 'src' then
+			error(('not a source (actual type: %s)'):format(ref.short.type))
+		end
+		return {
+			[Ref.long] = true;
+			short = ref.short.arg;
+			ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+			ext = ref.ext;
+		}
 	end
-	if ref.short.src_type == 'commit_log' then
-		for _, name, sub_ref in list(head(src_arg(ref))) do
-			if name == 'index' then
-				return fake_head {
-					short = sub_ref.short;
-					ext_i = 0;
-					ext = {
+	function Ref.src_view(ref)
+		assert(ref[Ref.long], 'not a long reference')
+		ref = assert(Ref.flesh(ref), 'TODO')
+		if ref.short.type ~= 'src' then
+			error(('not a source (actual type: %s)'):format(ref.short.type))
+		end
+		if ref.short.src_type == 'commit_log' then
+			for _, name, sub_ref in Ref.list(Ref.head(Ref.src_arg(ref))) do
+				if name == 'index' then
+					local index_ref = Ref.fake_head(sub_ref)
+					local val_place = {
+						[Place.short] = true;
 						type = 'src_val';
 						view = true;
-						ref = ref;
-						ref_short = ref.short;
-						ext_i = sub_ref.ext_i;
-						ext = sub_ref.ext;
+						from = ref.short;
+					}
+					val_place.ref = {
+						[Ref.long] = true;
+						short = index_ref.short;
+						ext_i = 0;
+						ext = {
+							from = {
+								[Place.long] = true;
+								short = val_place;
+								ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+								ext = ref.ext;
+							};
+							ext_i = index_ref.ext_i;
+							ext = index_ref.ext;
+						};
+					}
+					return val_place.ref
+				end
+			end
+			error 'TODO'
+		else
+			error(('TODO: src_type == %q'):format(ref.short.src_type))
+		end
+	end
+	function Ref.src_val(ref)
+		assert(ref[Ref.long], 'not a long reference')
+		ref = assert(Ref.flesh(ref), 'TODO')
+		if ref.short.type ~= 'src' then
+			error(('not a source (actual type: %s)'):format(ref.short.type))
+		end
+		if ref.short.real then
+			return ref.short.val
+		else
+			return Ref.src_view(ref)
+		end
+	end
+	function Ref.head(ref)
+		assert(ref[Ref.long], 'not a long reference')
+		ref = assert(Ref.flesh(ref), 'TODO')
+		while ref.short.type == 'src' do
+			ref = src_val(ref)
+			ref = assert(Ref.flesh(ref), 'TODO')
+		end
+		return ref
+	end
+	function Ref.fake_head(ref)
+		assert(ref[Ref.long], 'not a long reference')
+		ref = assert(Ref.flesh(ref), 'TODO')
+		while ref.short.type == 'src' do
+			local old_ref = ref
+			ref = src_val(ref)
+			ref = assert(Ref.flesh(ref), 'TODO')
+			if old_ref.short.src_type == 'fake_head' then
+				break
+			end
+		end
+		return ref
+	end
+	function Ref.list(ref)
+		assert(ref[Ref.long], 'not a long reference')
+		ref = assert(Ref.flesh(ref), 'TODO')
+		if ref.short.type ~= 'dir' then
+			error(('not a directory (actual type: %s)'):format(ref.short.type))
+		end
+		if ref.short.real then
+			return function(_, place)
+				if place then
+					ffi.C.seekdir(ref.short.handle, place)
+				else
+					ffi.C.rewinddir(ref.short.handle)
+				end
+				local dirent, name
+				repeat
+					dirent = ffi.C.readdir(ref.short.handle)
+					if dirent == nil then return nil end
+					name = ffi.string(dirent.d_name)
+				until name ~= '.' and name ~= '..' and name ~= '.fancfer-srcs' and name ~= '.fancfer-ssrcs'
+				return ffi.C.telldir(ref.short.handle), name, {
+					[Ref.long] = true;
+					short = {
+						[Ref.short] = true;
+						real = true;
+						dir = ref.short.handle;
+						name = name;
+						from = {
+							[Place.short] = true;
+							type = 'dir';
+							name = name;
+							from = ref.short;
+						};
 					};
+					ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+					ext = ref.ext;
+				}
+			end
+		else
+			local _next = store_sha256.retrieve_dir(ref.short.handle)
+			return function(_, place)
+				local place, name, hash = _next(_, place)
+				return place, name, {
+					[Ref.long] = true;
+					short = {
+						[Ref.short] = true;
+						real = false;
+						hash = hash;
+						from = {
+							[Place.short] = true;
+							type = 'dir';
+							from = ref.short;
+							name = name;
+						};
+					};
+					ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+					ext = ref.ext;
 				}
 			end
 		end
-		error 'TODO'
-	else
-		error(('TODO: src_type == %q'):format(ref.short.src_type))
 	end
-end
-function src_val(ref)
-	ref = assert(flesh(ref), 'TODO')
-	if ref.short.type ~= 'src' then
-		error(('not a source (actual type: %s)'):format(ref.short.type))
-	end
-	if ref.short.real then
-		return ref.short.val
-	else
-		return src_view(ref)
-	end
-end
-function head(ref)
-	ref = assert(flesh(ref), 'TODO')
-	while ref.short.type == 'src' do
-		ref = src_val(ref)
-		ref = assert(flesh(ref), 'TODO')
-	end
-	return ref
-end
-function fake_head(ref)
-	ref = assert(flesh(ref), 'TODO')
-	while ref.short.type == 'src' do
-		local old_ref = ref
-		ref = src_val(ref)
-		ref = assert(flesh(ref), 'TODO')
-		if old_ref.short.src_type == 'fake_head' then
-			break
+	function Ref.dir_at(ref, name_)
+		assert(ref[Ref.long], 'not a long reference')
+		for _, name, sub_ref in list(ref) do
+			if name == name_ then
+				return sub_ref
+			end
 		end
 	end
-	return ref
-end
-function list(ref)
-	ref = assert(flesh(ref), 'TODO')
-	if ref.short.type ~= 'dir' then
-		error(('not a directory (actual type: %s)'):format(ref.short.type))
+	function Ref.place(ref)
+		assert(ref[Ref.long], 'not a long reference')
+		return {
+			[Place.long] = true;
+			short = ref.short.from;
+			ext_i = ref.ext_i;
+			ext = ref.ext;
+		}
 	end
-	if ref.short.real then
-		return function(_, place)
-			if place then
-				ffi.C.seekdir(ref.short.handle, place)
+end
+do -- Place
+	Place.short = {name = 'place_short';}
+	Place.long = {name = 'place_long';}
+	function Place.backpath_iter(place, pick)
+		assert(place[Place.long], 'not a long place')
+		local function go_next(pick, st)
+			if st.ext_i == 0 then
+				if pick(st) then
+					return go_next(pick, st.ext.from)
+				else
+					return go_next(pick, {
+						[Place.long] = true;
+						short = st.short;
+						ext_i = st.ext.ext_i;
+						ext = st.ext.ext;
+					})
+				end
 			else
-				ffi.C.rewinddir(ref.short.handle)
+				if st.short and st.short.from then
+					return {
+						[Place.long] = true;
+						short = st.short.from.from;
+						ext_i = st.ext_i and st.ext_i - 1 or nil;
+						ext = st.ext;
+					}, st
+				else
+					return nil
+				end
 			end
-			local dirent, name
-			repeat
-				dirent = ffi.C.readdir(ref.short.handle)
-				if dirent == nil then return nil end
-				name = ffi.string(dirent.d_name)
-			until name ~= '.' and name ~= '..' and name ~= '.fancfer-srcs' and name ~= '.fancfer-ssrcs'
-			return ffi.C.telldir(ref.short.handle), name, {
-				short = {
-					real = true;
-					dir = ref.short.handle;
-					name = name;
-					from = {
-						type = 'dir';
-						name = name;
-						ref_short = ref.short;
+		end
+		return go_next, pick, place
+	end
+	function Place.str(place)
+		assert(place[Place.long], 'not a long place')
+		local parts = {}
+		local parts_n = 0
+		for up_ref, part in Place.backpath_iter(place, function() return true end) do
+			parts_n = parts_n + 1
+			local part_str
+			if part.type == 'src_arg' or part.type == 'src_val' then
+				part_str = part.type
+			elseif part.type == 'dir' then
+				part_str = 'dir:' .. part.name
+			elseif part.type == 'real_root' then
+				part_str = ('real_root(%s, %s)'):format(
+					readlinkat(-100, ('/proc/self/fd/%d'):format(ffi.C.dirfd(part.dir))),
+					part.name
+				)
+			else
+				error(('TODO: part.type == %q'):format(part.type))
+			end
+			parts[parts_n] = part_str
+		end
+		for i = 1, math.floor(parts_n/2) do
+			parts[i], parts[parts_n - i + 1] = parts[parts_n - i + 1], parts[i]
+		end
+		return table.concat(parts, '/')
+	end
+	function Place.ref(place)
+		assert(place[Place.long], 'not a long place')
+		if not place.short.ref then
+			if place.short.type == 'real_root' then
+				place.short.ref = Ref.flesh {
+					[Ref.long] = true;
+					short = {
+						[Ref.short] = true;
+						real = true;
+						dir = place.short.dir;
+						name = place.short.name;
+						from = place.short;
 					};
-				};
-				ext_i = ref.ext_i and ref.ext_i + 1 or nil;
-				ext = ref.ext;
-			}
-		end
-	else
-		local _next = retrieve_dir(ref.short.handle)
-		return function(_, place)
-			local place, name, hash = _next(_, place)
-			return place, name, {
-				short = {
-					real = false;
-					hash = hash;
-					from = {
-						type = 'dir';
-						ref_short = ref.short;
-						name = name;
-					};
-				};
-				ext_i = ref.ext_i and ref.ext_i + 1 or nil;
-				ext = ref.ext;
-			}
-		end
-	end
-end
-function dir_at(ref, name_)
-	for _, name, sub_ref in list(ref) do
-		if name == name_ then
-			return sub_ref
-		end
-	end
-end
-local function backpath(ref, pick)
-	local backpath = {}
-	local n = 0
-	local short, ext_i, ext = ref.short, ref.ext_i, ref.ext
-	while ext_i do
-		while ext_i > 0 do
-			n = n + 1
-			backpath[n] = short.from
-			short = short.from.ref_short
-			ext_i = ext_i and ext_i - 1 or nil
-		end
-		if pick(backpath, short, ext) then
-			n = n + 1
-			backpath[n] = ext
-			short = ext.ref.short
-			ext_i = ext.ref.ext_i
-			ext = ext.ref.ext
-		else
-			ext_i = ext.ext_i
-			ext = ext.ext
-		end
-	end
-	while short.from do
-		n = n + 1
-		backpath[n] = short.from
-		short = short.from.ref_short
-	end
-	backpath.n = n
-	return backpath
-end
-local function backpath_iter(ref, pick)
-	return function(pick, st)
-		if st.ext_i == 0 then
-			if pick(st) then
-				return st.ext.ref, st.ext
+				}
 			else
-				return {
-					short = st.short;
-					ext_i = st.ext.ext_i;
-					ext = st.ext.ext;
-				}, st.ext
-			end
-		else
-			if st.short and st.short.from then
-				return {
-					short = st.short.from.ref_short;
-					ext_i = st.ext_i and st.ext_i - 1 or nil;
-					ext = st.ext;
-				}, st.short.from
-			else
-				return nil
+				error(('TODO: place.type == %q'):format(place.type))
 			end
 		end
-	end, pick, ref
+		return {
+			[Place.long] = true;
+			short = place.short.ref.short;
+			ext_i = 0;
+			ext = {
+				from = place;
+				ext_i = place.short.ref.ext_i;
+				ext = place.short.ref.ext;
+			};
+		}
+	end
+	function Place.from(place)
+		assert(place[Place.long], 'not a long place')
+		return {
+			[Ref.long] = true;
+			short = place.short.from;
+			ext_i = place.ext_i and place.ext_i - 1 or nil;
+			ext = place.ext;
+		}
+	end
 end
 local function path_str(path, step)
 	local start, stop
@@ -768,7 +870,7 @@ local function path_str(path, step)
 			parts[j] = '/' .. path[i].name
 			last_dir = j
 		elseif path[i].type == 'src_arg' then
-			local h = head { short = path[i].ref_short; }
+			local h = head { short = path[i].from; }
 			if h and h.short.type == 'dir' then
 				parts[j] = '/.fancfer-src/TODO'
 			else
@@ -783,23 +885,24 @@ local function path_str(path, step)
 	end
 	return table.concat(parts)
 end
+
 local realize, realize_pending_dir, realize_pending_file
 function realize_find_pending(ref)
 	local srcs = {}
 	local srcs_n = 0
 	local in_src_arg
-	for up_ref, part in backpath_iter(ref, function() return true end) do
-		if part.type == 'src_val' then
+	for _, part in Place.backpath_iter(Ref.place(ref), function() return true end) do
+		if part.short.type == 'src_val' then
 			srcs_n = srcs_n + 1
-			srcs[srcs_n] = up_ref
-		elseif part.type == 'src_arg' then
-			in_src_arg = up_ref
-		elseif part.type == 'dir' then
+			srcs[srcs_n] = Place.from(part)
+		elseif part.short.type == 'src_arg' then
+			in_src_arg = Place.from(part)
+		elseif part.short.type == 'dir' then
 			break
-		elseif part.type == 'unrealized' then
-		elseif part.type == 'virtual_root' then
+		elseif part.short.type == 'unrealized' then
+		elseif part.short.type == 'virtual_root' then
 		else
-			error(('TODO: part.type == %q'):format(part.type))
+			error(('TODO: part.short.type == %q'):format(part.type))
 		end
 	end
 	srcs.n = srcs_n
@@ -815,7 +918,7 @@ function realize_pending_dir(ref, handle, opts)
 		local digits = #tostring(srcs.n)
 		for i = srcs.n, 1, -1 do
 			assert(not srcs[i].short.real or srcs[i].short.src_in_dir, 'TODO')
-			realize(src_arg(srcs[i]), srcs_dir, ('%%0%dd'):format(digits):format(srcs.n - i + 1), opts)
+			realize(Ref.src_arg(srcs[i]), srcs_dir, ('%%0%dd'):format(digits):format(srcs.n - i + 1), opts)
 		end
 	end
 	if in_src_arg then
@@ -853,20 +956,20 @@ function realize_pending_file(ref, dir, name, opts)
 	end
 end
 function realize(ref, dir, name, opts)
-	ref = assert(flesh(ref), 'TODO')
+	ref = assert(Ref.flesh(ref), 'TODO')
 	assert(not ref.real, 'TODO')
 	if not opts.filter(ref, dir, name) then
 		realize_pending_file(ref, dir, name, opts)
 		if ffi.C.symlinkat('.fancfer-unrealized/' .. ref.short.hash, ffi.C.dirfd(dir), name) == -1 then cerror() end
 	elseif ref.short.type == 'src' then
-		realize(src_val(ref), dir, name, opts)
+		realize(Ref.src_val(ref), dir, name, opts)
 	elseif ref.short.type == 'dir' then
 		if ffi.C.mkdirat(ffi.C.dirfd(dir), name, normal_dir_mode) == -1 then cerror() end
 		local fd = ffi.C.openat(ffi.C.dirfd(dir), name, ffi.C.O_DIRECTORY, 0)
 		if fd == -1 then cerror() end
 		local handle = ffi.gc(ffi.C.fdopendir(fd), ffi.C.closedir)
 		realize_pending_dir(ref, handle, opts)
-		for _, name, sub_ref in list(ref) do
+		for _, name, sub_ref in Ref.list(ref) do
 			realize(sub_ref, handle, name, opts)
 		end
 	elseif ref.short.type == 'blob' then
@@ -886,68 +989,30 @@ function realize(ref, dir, name, opts)
 		error(('TODO: ref.short.type == %q'):format(ref.short.type))
 	end
 end
-local function ref_str(ref)
-	local parts = {}
-	local parts_n = 0
-	for up_ref, part in backpath_iter(ref, function() return true end) do
-		parts_n = parts_n + 1
-		local part_str
-		if part.type == 'src_arg' or part.type == 'src_val' then
-			part_str = part.type
-		elseif part.type == 'dir' then
-			part_str = 'dir:' .. part.name
-		elseif part.type == 'real_root' then
-			part_str = ('real_root(%s, %s)'):format(
-				readlinkat(-100, ('/proc/self/fd/%d'):format(ffi.C.dirfd(part.dir))),
-				part.name
-			)
-		else
-			error(('TODO: part.type == %q'):format(part.type))
-		end
-		parts[parts_n] = part_str
-	end
-	for i = 1, math.floor(parts_n/2) do
-		parts[i], parts[parts_n - i + 1] = parts[parts_n - i + 1], parts[i]
-	end
-	return table.concat(parts, '/')
-end
-local function flesh_place(place)
-	if place.short.type == 'real_root' then
-		place.short.ref = flesh {
-			short = {
-				real = true;
-				dir = place.short.dir;
-				name = place.short.name;
-				from = place.short;
-			};
-		}
-		return place
-	else
-		error(('TODO: place.type == %q'):format(place.type))
-	end
-end
 
 local function copy(src, dst, opts)
-	src = assert(flesh(src), 'TODO')
-	dst = assert(flesh_place(dst), 'TODO')
-	print(ref_str(src))
+	src = assert(Ref.flesh(src), 'TODO')
+	-- dst = assert(Place.flesh(dst), 'TODO')
+	print(Place.str(Ref.place(src)))
 end
 
-local test_obj = add_src('commit_log', add_dir {
-	{'index', add_dir {
-		{'foo', add_blob_str 'foo1'};
+local test_obj = store_sha256.add_src('commit_log', store_sha256.add_dir {
+	{'index', store_sha256.add_dir {
+		{'foo', store_sha256.add_blob_str 'foo1'};
 	}};
 })
--- local test_obj = add_diror {
--- 	{'wat', add_src('commit_log', add_dir {
--- 		{'index', add_blob_str 'foo1'};
+-- local test_obj = store_sha256_add_dir {
+-- 	{'wat', store_sha256.add_src('commit_log', store_sha256.add_dir {
+-- 		{'index', store_sha256.add_blob_str 'foo1'};
 -- 	})};
 -- }
 
-local test_ref = { short = {
+local test_ref = { [Ref.long] = true; short = {
+	[Ref.short] = true;
 	real = false;
 	hash = test_obj;
 	from = {
+		[Place.short] = true;
 		type = 'virtual_root';
 		hash = test_obj;
 	};
@@ -960,26 +1025,24 @@ realize(test_ref, root, 'test1', {
 	end;
 })
 
-local root_ref = flesh { short = {
-	real = true;
-	dir = root;
-	name = 'test1';
-	from = {
-		type = 'real_root';
-		dir = root;
-		name = 'test1';
-	};
-}; }
+-- local root1_place = Place.flesh { short = {
+-- 	type = 'real_root';
+-- 	dir = root;
+-- 	name = 'test1';
+-- }; }
+-- local root1_ref = Ref.flesh(Place.ref(root1_place))
+--
+-- local root2_place = { short = {
+-- 	type = 'real_root';
+-- 	dir = root;
+-- 	name = 'test2';
+-- }; }
+--
+-- copy(Ref.head(root1_ref), root2_place, {
+-- 	filter = function(src, dst)
+-- 		print(src, dst)
+-- 		return true
+-- 	end;
+-- })
 
-local root2_place = { short = {
-	type = 'real_root';
-	dir = root;
-	name = 'test2';
-}; }
-
-copy(head(root_ref), root2_place, {
-	filter = function(src, dst)
-		print(src, dst)
-		return true
-	end;
-})
+-- ref_short.from.ref == ref
