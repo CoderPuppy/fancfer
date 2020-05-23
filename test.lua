@@ -650,7 +650,12 @@ do -- Ref
 			error(('not a source (actual type: %s)'):format(ref.short.type))
 		end
 		if ref.short.real then
-			return ref.short.val
+			return {
+				[Ref.long] = true;
+				short = ref.short.val.ref.short;
+				ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+				ext = ref.ext;
+			}
 		else
 			return Ref.src_view(ref)
 		end
@@ -659,7 +664,7 @@ do -- Ref
 		assert(ref[Ref.long], 'not a long reference')
 		ref = assert(Ref.flesh(ref), 'TODO')
 		while ref.short.type == 'src' do
-			ref = src_val(ref)
+			ref = Ref.src_val(ref)
 			ref = assert(Ref.flesh(ref), 'TODO')
 		end
 		return ref
@@ -791,20 +796,20 @@ do -- Place
 		assert(place[Place.long], 'not a long place')
 		local parts = {}
 		local parts_n = 0
-		for up_ref, part in Place.backpath_iter(place, function() return true end) do
+		for _, part in Place.backpath_iter(place, function() return true end) do
 			parts_n = parts_n + 1
 			local part_str
-			if part.type == 'src_arg' or part.type == 'src_val' then
-				part_str = part.type
-			elseif part.type == 'dir' then
-				part_str = 'dir:' .. part.name
-			elseif part.type == 'real_root' then
+			if part.short.type == 'src_arg' or part.short.type == 'src_val' then
+				part_str = part.short.type
+			elseif part.short.type == 'dir' then
+				part_str = 'dir:' .. part.short.name
+			elseif part.short.type == 'real_root' then
 				part_str = ('real_root(%s, %s)'):format(
-					readlinkat(-100, ('/proc/self/fd/%d'):format(ffi.C.dirfd(part.dir))),
-					part.name
+					readlinkat(-100, ('/proc/self/fd/%d'):format(ffi.C.dirfd(part.short.dir))),
+					part.short.name
 				)
 			else
-				error(('TODO: part.type == %q'):format(part.type))
+				error(('TODO: part.short.type == %q'):format(part.short.type))
 			end
 			parts[parts_n] = part_str
 		end
@@ -832,7 +837,7 @@ do -- Place
 			end
 		end
 		return {
-			[Place.long] = true;
+			[Ref.long] = true;
 			short = place.short.ref.short;
 			ext_i = 0;
 			ext = {
@@ -902,7 +907,7 @@ function realize_find_pending(ref)
 		elseif part.short.type == 'unrealized' then
 		elseif part.short.type == 'virtual_root' then
 		else
-			error(('TODO: part.short.type == %q'):format(part.type))
+			error(('TODO: part.short.type == %q'):format(part.short.type))
 		end
 	end
 	srcs.n = srcs_n
@@ -1025,24 +1030,25 @@ realize(test_ref, root, 'test1', {
 	end;
 })
 
--- local root1_place = Place.flesh { short = {
--- 	type = 'real_root';
--- 	dir = root;
--- 	name = 'test1';
--- }; }
--- local root1_ref = Ref.flesh(Place.ref(root1_place))
---
--- local root2_place = { short = {
--- 	type = 'real_root';
--- 	dir = root;
--- 	name = 'test2';
--- }; }
---
--- copy(Ref.head(root1_ref), root2_place, {
--- 	filter = function(src, dst)
--- 		print(src, dst)
--- 		return true
--- 	end;
--- })
+local root1_place = { [Place.long] = true; short = {
+	[Place.short] = true;
+	type = 'real_root';
+	dir = root;
+	name = 'test1';
+}; }
+local root1_ref = Ref.flesh(Place.ref(root1_place))
+
+local root2_place = { short = {
+	type = 'real_root';
+	dir = root;
+	name = 'test2';
+}; }
+
+copy(Ref.head(root1_ref), root2_place, {
+	filter = function(src, dst)
+		print(src, dst)
+		return true
+	end;
+})
 
 -- ref_short.from.ref == ref
