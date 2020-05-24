@@ -563,6 +563,9 @@ do -- Ref
 				error(('TODO: target = %q'):format(target))
 			elseif ft == ffi.C.S_IFREG then
 				ref.short.type = 'blob'
+				local fd = ffi.C.openat(ffi.C.dirfd(ref.short.dir), ref.short.name, ffi.C.O_RDWR, 0)
+				if fd == -1 then cerror() end
+				ref.short.handle = ffi.gc(ffi.C.fdopen(fd, 'r+'), ffi.C.fclose)
 				return orig_ref
 			else
 				error(('TODO: ft == %06o'):format(ft))
@@ -600,7 +603,7 @@ do -- Ref
 		return {
 			[Ref.long] = true;
 			short = ref.short.arg;
-			ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+			ext_i = ref.ext_i and ref.ext_i + 1;
 			ext = ref.ext;
 		}
 	end
@@ -628,7 +631,7 @@ do -- Ref
 							from = {
 								[Place.long] = true;
 								short = val_place;
-								ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+								ext_i = ref.ext_i and ref.ext_i + 1;
 								ext = ref.ext;
 							};
 							ext_i = index_ref.ext_i;
@@ -653,7 +656,7 @@ do -- Ref
 			return {
 				[Ref.long] = true;
 				short = ref.short.val.ref.short;
-				ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+				ext_i = ref.ext_i and ref.ext_i + 1;
 				ext = ref.ext;
 			}
 		else
@@ -715,7 +718,7 @@ do -- Ref
 							from = ref.short;
 						};
 					};
-					ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+					ext_i = ref.ext_i and ref.ext_i + 1;
 					ext = ref.ext;
 				}
 			end
@@ -736,7 +739,7 @@ do -- Ref
 							name = name;
 						};
 					};
-					ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+					ext_i = ref.ext_i and ref.ext_i + 1;
 					ext = ref.ext;
 				}
 			end
@@ -744,7 +747,7 @@ do -- Ref
 	end
 	function Ref.dir_at(ref, name_)
 		assert(ref[Ref.long], 'not a long reference')
-		for _, name, sub_ref in list(ref) do
+		for _, name, sub_ref in Ref.list(ref) do
 			if name == name_ then
 				return sub_ref
 			end
@@ -763,34 +766,36 @@ end
 do -- Place
 	Place.short = {name = 'place_short';}
 	Place.long = {name = 'place_long';}
-	function Place.backpath_iter(place, pick)
-		assert(place[Place.long], 'not a long place')
-		local function go_next(pick, st)
-			if st.ext_i == 0 then
-				if pick(st) then
-					return go_next(pick, st.ext.from)
-				else
-					return go_next(pick, {
-						[Place.long] = true;
-						short = st.short;
-						ext_i = st.ext.ext_i;
-						ext = st.ext.ext;
-					})
-				end
+	Place.backpath_iter_done = {name = 'backpath_iter_done';}
+	function Place.backpath_iter_next(pick, st)
+		if st == Place.backpath_iter_done then return end
+		if st.ext_i == 0 then
+			if pick(st) then
+				return Place.backpath_iter_next(pick, st.ext.from)
 			else
-				if st.short and st.short.from then
-					return {
-						[Place.long] = true;
-						short = st.short.from.from;
-						ext_i = st.ext_i and st.ext_i - 1 or nil;
-						ext = st.ext;
-					}, st
-				else
-					return nil
-				end
+				return Place.backpath_iter_next(pick, {
+					[Place.long] = true;
+					short = st.short;
+					ext_i = st.ext.ext_i;
+					ext = st.ext.ext;
+				})
+			end
+		else
+			if st.short and st.short.from then
+				return {
+					[Place.long] = true;
+					short = st.short.from.from;
+					ext_i = st.ext_i and st.ext_i - 1;
+					ext = st.ext;
+				}, st
+			else
+				return Place.backpath_iter_done, st
 			end
 		end
-		return go_next, pick, place
+	end
+	function Place.backpath_iter(place, pick)
+		assert(place[Place.long], 'not a long place')
+		return Place.backpath_iter_next, pick, place
 	end
 	function Place.str(place)
 		assert(place[Place.long], 'not a long place')
@@ -820,7 +825,7 @@ do -- Place
 	end
 	function Place.ref(place)
 		assert(place[Place.long], 'not a long place')
-		if not place.short.ref then
+		if not place.short.fleshed then
 			if place.short.type == 'real_root' then
 				place.short.ref = Ref.flesh {
 					[Ref.long] = true;
@@ -832,11 +837,16 @@ do -- Place
 						from = place.short;
 					};
 				}
+			elseif place.short.type == 'dir' then
+				place.short.ref = Ref.dir_at({
+					[Ref.long] = true;
+					short = place.short.from;
+				}, place.short.name)
 			else
-				error(('TODO: place.type == %q'):format(place.type))
+				error(('TODO: place.short.type == %q'):format(place.short.type))
 			end
 		end
-		return {
+		return place.short.ref and {
 			[Ref.long] = true;
 			short = place.short.ref.short;
 			ext_i = 0;
@@ -852,9 +862,30 @@ do -- Place
 		return {
 			[Ref.long] = true;
 			short = place.short.from;
-			ext_i = place.ext_i and place.ext_i - 1 or nil;
+			ext_i = place.ext_i and place.ext_i - 1;
 			ext = place.ext;
 		}
+	end
+	function Place.real(place)
+		assert(place[Place.long], 'not a long place')
+		if place.short.type == 'real_root' then
+			return place.short.dir, place.short.name
+		elseif place.short.type == 'dir' then
+			if place.short.from.real then
+				assert(place.short.from.type == 'dir', 'TODO')
+				return place.short.from.handle, place.short.name
+			end
+		else
+			error(('TODO: place.short.type == %q'):format(place.short.type))
+		end
+	end
+	function Place.clear(place)
+		assert(place[Place.long], 'not a long place')
+		place.short.ref = nil
+		while place and place.ext_i == 0 do
+			Place.clear(place.ext.from)
+			place = place.ext
+		end
 	end
 end
 local function path_str(path, step)
@@ -987,7 +1018,7 @@ function realize(ref, dir, name, opts)
 		if ffi.C.unlinkat(ffi.C.dirfd(dir), name, 0) == -1 then cerror() end
 		realize({
 			short = ref.short.obj;
-			ext_i = ref.ext_i and ref.ext_i + 1 or nil;
+			ext_i = ref.ext_i and ref.ext_i + 1;
 			ext = ref.ext;
 		}, dir, name, opts)
 	else
@@ -995,10 +1026,121 @@ function realize(ref, dir, name, opts)
 	end
 end
 
+local function delete(ref)
+	ref = assert(Ref.flesh(ref), 'TODO')
+	assert(ref.short.real)
+	print('delete', readlinkat(-100, ('/proc/self/fd/%d'):format(ffi.C.dirfd(ref.short.dir))), ref.short.name)
+	if ref.short.type == 'blob' then
+		if ffi.C.unlinkat(ffi.C.dirfd(ref.short.dir), ref.short.name, 0) == -1 then cerror() end
+		Place.clear(Ref.place(ref))
+	else
+		error(('TODO: ref.short.type == %q'):format(ref.short.type))
+	end
+end
 local function copy(src, dst, opts)
-	src = assert(Ref.flesh(src), 'TODO')
-	-- dst = assert(Place.flesh(dst), 'TODO')
-	print(Place.str(Ref.place(src)))
+	src = assert(Ref.flesh(Ref.head(src)), 'TODO')
+	local dir, name = Place.real(dst)
+	print('copy', Place.str(Ref.place(src)), Place.str(dst), readlinkat(-100, ('/proc/self/fd/%d'):format(ffi.C.dirfd(dir))), name)
+	if dir then
+		local dst_ref = Place.ref(dst)
+		if dst_ref then
+			dst_ref = assert(Ref.flesh(Ref.head(dst_ref)), 'TODO')
+			dst = Ref.place(dst_ref)
+		end
+		local dst_type = dst_ref and dst_ref.short.type
+		if src.short.type == 'dir' and dst_type == 'dir' then
+			local src_next, src_const, src_st = Ref.list(src)
+			local dst_next, dst_const, dst_st = Ref.list(dst_ref)
+			local src_name, src_sub_ref
+			local dst_name, dst_sub_ref
+			src_st, src_name, src_sub_ref = src_next(src_const, src_st)
+			dst_st, dst_name, dst_sub_ref = dst_next(dst_const, dst_st)
+			while src_st or dst_st do
+				if src_st and (not dst_st or src_name < dst_name) then
+					copy(src_sub_ref, {
+						[Place.long] = true;
+						short = {
+							[Place.short] = true;
+							type = 'dir';
+							from = dst_ref.short;
+							name = src_name;
+						};
+						ext_i = dst_ref.ext_i and dst_ref.ext_i + 1;
+						ext = dst_ref.ext;
+					}, opts)
+					src_st, src_name, src_sub_ref = src_next(src_const, src_st)
+				elseif dst_st and (not src_st or dst_name < src_name) then
+					delete(dst_sub_ref)
+					dst_st, dst_name, dst_sub_ref = dst_next(dst_const, dst_st)
+				elseif src_st and dst_st and src_name == dst_name then
+					copy(src_sub_ref, Ref.place(dst_sub_ref), opts)
+					src_st, src_name, src_sub_ref = src_next(src_const, src_st)
+					dst_st, dst_name, dst_sub_ref = dst_next(dst_const, dst_st)
+				else
+					error 'bad'
+				end
+			end
+		else
+			-- TODO: renameat2 with RENAME_EXCHANGE
+			if dst_ref then delete(dst_ref) end
+			if src.short.type == 'dir' then
+				if ffi.C.mkdirat(ffi.C.dirfd(dir), name, normal_dir_mode) == -1 then cerror() end
+				local fd = ffi.C.openat(ffi.C.dirfd(dir), name, ffi.C.O_DIRECTORY, 0)
+				if fd == -1 then cerror() end
+				local handle = ffi.gc(ffi.C.fdopendir(fd), ffi.C.closedir)
+				-- TODO: copy pending
+				dst.short.ref = {
+					[Ref.long] = true;
+					short = {
+						[Ref.short] = true;
+						real = true;
+						type = 'dir';
+						handle = handle;
+						dir = dir;
+						name = name;
+						from = dst.short;
+					};
+					ext_i = dst.ext_i;
+					ext = dst.ext;
+				}
+				for _, name, sub_ref in Ref.list(src) do
+					copy(sub_ref, {
+						[Place.long] = true;
+						short = {
+							[Place.short] = true;
+							type = 'dir';
+							from = dst.short.ref.short;
+						};
+						ext_i = dst.ext_i and dst.ext_i + 1;
+						ext = dst.ext;
+					}, opts)
+				end
+			elseif src.short.type == 'blob' then
+				local fd = ffi.C.openat(ffi.C.dirfd(dir), name, bit.bor(ffi.C.O_CREAT, ffi.C.O_RDWR), normal_file_mode)
+				if fd == -1 then cerror() end
+				if ffi.C.ioctl(fd, ffi.C.FICLONE, ffi.cast('int', ffi.C.fileno(src.short.handle))) == -1 then cerror() end
+				local handle = ffi.gc(ffi.C.fdopen(fd, 'r+'), ffi.C.fclose)
+				dst.short.ref = {
+					[Ref.long] = true;
+					short = {
+						[Ref.short] = true;
+						real = true;
+						type = 'blob';
+						handle = handle;
+						dir = dir;
+						name = name;
+						from = dst.short;
+					};
+					ext_i = dst.ext_i;
+					ext = dst.ext;
+				}
+			else
+				error(('TODO: src.short.type == %q'):format(src.short.type))
+			end
+		end
+	else
+		error 'TODO'
+	end
 end
 
 local test_obj = store_sha256.add_src('commit_log', store_sha256.add_dir {
@@ -1023,12 +1165,12 @@ local test_ref = { [Ref.long] = true; short = {
 	};
 }; }
 
-realize(test_ref, root, 'test1', {
-	filter = function(ref, dir, name)
-		return true
-		-- return not (ref.short.from and ref.short.from.type == 'src_arg')
-	end;
-})
+-- realize(test_ref, root, 'test1', {
+-- 	filter = function(ref, dir, name)
+-- 		return true
+-- 		-- return not (ref.short.from and ref.short.from.type == 'src_arg')
+-- 	end;
+-- })
 
 local root1_place = { [Place.long] = true; short = {
 	[Place.short] = true;
@@ -1038,11 +1180,14 @@ local root1_place = { [Place.long] = true; short = {
 }; }
 local root1_ref = Ref.flesh(Place.ref(root1_place))
 
-local root2_place = { short = {
+local root2_place = { [Place.long] = true; short = {
+	[Place.short] = true;
 	type = 'real_root';
 	dir = root;
 	name = 'test2';
 }; }
+
+print(Place.ref(root2_place))
 
 copy(Ref.head(root1_ref), root2_place, {
 	filter = function(src, dst)
