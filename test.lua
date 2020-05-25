@@ -290,7 +290,7 @@ local store_sha256 = {}; do
 		local hash = hasher()
 
 		if ffi.C.fsetxattr(tmp, 'user.fancfer.object-type', 'blob', 4, ffi.C.XATTR_CREATE) == -1 then cerror() end
-		if ffi.C.linkat(-100, ('/proc/self/fd/%d'):format(tmp), store_sha256.dir, hash, ffi.C.AT_SYMLINK_FOLLOW) == -1 then
+		if ffi.C.linkat(-100, ('/proc/self/fd/%d'):format(tmp), ffi.C.dirfd(store_sha256.dir), hash, ffi.C.AT_SYMLINK_FOLLOW) == -1 then
 			local errno = ffi.errno()
 			if errno == ffi.C.EEXIST then
 			else
@@ -600,9 +600,10 @@ do -- Ref
 		if ref.short.type ~= 'src' then
 			error(('not a source (actual type: %s)'):format(ref.short.type))
 		end
+		assert(not ref.short.arg.ref.ext_i, 'TODO')
 		return {
 			[Ref.long] = true;
-			short = ref.short.arg;
+			short = ref.short.arg.ref.short;
 			ext_i = ref.ext_i and ref.ext_i + 1;
 			ext = ref.ext;
 		}
@@ -1116,6 +1117,7 @@ local function copy(src, dst, opts)
 					}, opts)
 				end
 			elseif src.short.type == 'blob' then
+				-- TODO: copy pending
 				local fd = ffi.C.openat(ffi.C.dirfd(dir), name, bit.bor(ffi.C.O_CREAT, ffi.C.O_RDWR), normal_file_mode)
 				if fd == -1 then cerror() end
 				if ffi.C.ioctl(fd, ffi.C.FICLONE, ffi.cast('int', ffi.C.fileno(src.short.handle))) == -1 then cerror() end
@@ -1140,6 +1142,27 @@ local function copy(src, dst, opts)
 		end
 	else
 		error 'TODO'
+	end
+end
+
+local function unrealized(ref, opts)
+	ref = assert(Ref.flesh(ref), 'TODO')
+	if not ref.short.real then return ref.short.hash end
+	if ref.short.type == 'dir' then
+		-- TODO: this should not reimplement store_sha256.add_dir
+		local builder = store_sha256.add_object_build 'dir'
+		for _, name, sub_ref in Ref.list(ref) do
+			builder(unrealized(sub_ref, opts)) '\0'
+			builder(name) '\0'
+		end
+		return builder()
+	elseif ref.short.type == 'blob' then
+		return store_sha256.add_blob_fd(ffi.C.fileno(ref.short.handle))
+	elseif ref.short.type == 'src' then
+		-- TODO
+		return store_sha256.add_src(ref.short.src_type, unrealized(Ref.src_arg(ref), opts))
+	else
+		error(('TODO: ref.short.type == %q'):format(ref.short.type))
 	end
 end
 
@@ -1187,13 +1210,13 @@ local root2_place = { [Place.long] = true; short = {
 	name = 'test2';
 }; }
 
-print(Place.ref(root2_place))
-
 copy(Ref.head(root1_ref), root2_place, {
 	filter = function(src, dst)
 		print(src, dst)
 		return true
 	end;
 })
+
+print(unrealized(Place.ref(root1_place), { }))
 
 -- ref_short.from.ref == ref
