@@ -5,3 +5,23 @@ split information between drives
 filesystem help for keeping the "index" up to date, see VFSforGit and Scalar
 content aware chunking
 tree based hashing: see Blake3
+
+checking for changes
+	keep backbackrefs from the targets of backrefs to the backrefs
+	if something within the target is updated, make sure the backref is checked as well
+	these can appear just inside backheads, i.e. not inside a source's value
+	so directories, files and unrealized
+operations
+	{,un}realize, copy {up,down} {from,to}
+
+	simultaneously descend multiple trees
+		handles copying
+		TODO: {,un}realize
+
+		how to handle backbackrefs?
+			delay the tree, handle when all parts are ready
+			requires delaying dependencies as well
+
+		how to record where all the places are?
+
+		I think this is completely infeasible (at least with down arrows)
