@@ -30,7 +30,7 @@ enum statx_mask {
 	STATX_BTIME       = 0x00000800,
 	STATX_ALL         = 0x00000fff
 };
-struct statx {
+struct statx_st {
 	uint32_t stx_mask;
 	uint32_t stx_blksize;
 	uint64_t stx_attributes;
@@ -53,7 +53,7 @@ struct statx {
 	uint32_t stx_dev_minor;
 	uint64_t __spare2[14];
 };
-int statx(int dirfd, const char *pathname, int32_t flags, enum statx_mask mask, struct statx *statxbuf);
+int statx(int dirfd, const char *pathname, int32_t flags, enum statx_mask mask, struct statx_st *statxbuf);
 int ioctl_ficlone(int dest_fd, int src_fd);
 enum renameat2_flags {
 	RENAME_NOREPLACE = 1 << 0,

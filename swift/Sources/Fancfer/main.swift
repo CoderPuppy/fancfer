@@ -3,6 +3,9 @@ import Glibc
 import FancferC
 import Foundation
 
+struct TODO: Error {
+}
+
 extension Sequence {
 	@inlinable
 	func withUnsafeBufferPointer<R>(
@@ -191,72 +194,72 @@ extension Digest {
 struct InvalidObject: Error {
 }
 
-struct Store<H: HashFunction> {
-	var dir: Directory
-	var hf: H.Type
+struct Object {
+	let hash: String
+	let type: String
+	let file: File
 
-	struct Object {
-		let hash: String
-		let type: String
-		var file: File
-
-		internal init(hash: String, file: File) throws {
-			self.hash = hash
-			self.file = file
-			self.type = try "user.fancfer.object-type".withCString { (key_ptr) in
-				let expectedSize = FancferC.fgetxattr(file.fd, key_ptr, nil, 0)
-				guard expectedSize != -1 else {
+	internal init(hash: String, file: File) throws {
+		self.hash = hash
+		self.file = file
+		self.type = try "user.fancfer.object-type".withCString { (key_ptr) in
+			let expectedSize = FancferC.fgetxattr(file.fd, key_ptr, nil, 0)
+			guard expectedSize != -1 else {
+				throw CError(errno: Glibc.errno)
+			}
+			return try String(unsafeUninitializedCapacity: Int(expectedSize), initializingUTF8With: { (buffer) in
+				let realSize = FancferC.fgetxattr(file.fd, key_ptr, UnsafeMutableRawPointer(buffer.baseAddress!), buffer.count)
+				guard realSize != -1 else {
 					throw CError(errno: Glibc.errno)
 				}
-				return try String(unsafeUninitializedCapacity: Int(expectedSize), initializingUTF8With: { (buffer) in
-					let realSize = FancferC.fgetxattr(file.fd, key_ptr, UnsafeMutableRawPointer(buffer.baseAddress!), buffer.count)
-					guard realSize != -1 else {
-						throw CError(errno: Glibc.errno)
-					}
-					return Int(realSize)
-				})
-			}
-		}
-
-		func contents() throws -> String {
-			try self.file.seekTo(startPlus: 0)
-			let buffer = try self.file.readAll()
-			defer { Glibc.free(buffer.baseAddress!) }
-			return String(cString: buffer.baseAddress!)
-		}
-
-		func dir() throws -> Dictionary<String, String> {
-			guard self.type == "dir" else { throw InvalidObject() }
-			try self.file.seekTo(startPlus: 0)
-			let getdelim = File.Getdelim()
-			var dict = Dictionary<String, String>()
-			while let hash = try getdelim.read(from: self.file, delimitedBy: 0) {
-				guard let name = try getdelim.read(from: self.file, delimitedBy: 0) else {
-					throw InvalidObject()
-				}
-				dict[name] = hash
-			}
-			return dict
-		}
-
-		func blob() throws -> String {
-			guard self.type == "blob" else { throw InvalidObject() }
-			return try self.contents()
-		}
-
-		func src() throws -> (String, String) {
-			guard self.type == "src" else { throw InvalidObject() }
-			try self.file.seekTo(startPlus: 0)
-			let getdelim = File.Getdelim()
-			guard let type = try getdelim.read(from: self.file, delimitedBy: 0) else {
-				throw InvalidObject()
-			}
-			guard let arg = try getdelim.read(from: self.file, delimitedBy: 0) else {
-				throw InvalidObject()
-			}
-			return (type, arg)
+				return Int(realSize)
+			})
 		}
 	}
+
+	func contents() throws -> String {
+		try self.file.seekTo(startPlus: 0)
+		let buffer = try self.file.readAll()
+		defer { Glibc.free(buffer.baseAddress!) }
+		return String(cString: buffer.baseAddress!)
+	}
+
+	func dir() throws -> Dictionary<String, String> {
+		guard self.type == "dir" else { throw InvalidObject() }
+		try self.file.seekTo(startPlus: 0)
+		let getdelim = File.Getdelim()
+		var dict = Dictionary<String, String>()
+		while let hash = try getdelim.read(from: self.file, delimitedBy: 0) {
+			guard let name = try getdelim.read(from: self.file, delimitedBy: 0) else {
+				throw InvalidObject()
+			}
+			dict[name] = hash
+		}
+		return dict
+	}
+
+	func blob() throws -> String {
+		guard self.type == "blob" else { throw InvalidObject() }
+		return try self.contents()
+	}
+
+	func src() throws -> (String, String) {
+		guard self.type == "src" else { throw InvalidObject() }
+		try self.file.seekTo(startPlus: 0)
+		let getdelim = File.Getdelim()
+		guard let type = try getdelim.read(from: self.file, delimitedBy: 0) else {
+			throw InvalidObject()
+		}
+		guard let arg = try getdelim.read(from: self.file, delimitedBy: 0) else {
+			throw InvalidObject()
+		}
+		return (type, arg)
+	}
+}
+
+struct Store<H: HashFunction> {
+	let dir: Directory
+	let hf: H.Type
 
 	func lookup(hash: String) throws -> Object? {
 		let fd = try (dir/hash)._open(flags: Glibc.O_RDONLY, mode: 0)
@@ -363,6 +366,88 @@ struct Store<H: HashFunction> {
 		builder.write(arg + "\0")
 		return try builder.finalize()
 	}
+}
+
+protocol Place {
+	var ref: Ref? { get }
+}
+protocol Ref {
+	var type: String { get }
+	var place: Place { get }
+}
+class StoreRef: Ref {
+	let obj: Object
+	let storePlace: StorePlace
+	var place: Place { get { storePlace } }
+	var type: String { get { obj.type } }
+
+	init(obj: Object, place: StorePlace) {
+		self.obj = obj
+		self.storePlace = place
+	}
+}
+enum StorePlace: Place {
+	case dir(String, StoreRef)
+	case srcArg(StoreRef)
+	case unrealized(RealRef)
+
+	var ref: Ref? { get { switch self {
+		case .dir(_, let ref): return ref
+		case .srcArg(let ref): return ref
+		case .unrealized(let ref): return ref
+	} } }
+}
+class RealRef: Ref {
+	let fsRef: FSRef
+	let realPlace: RealPlace
+	var place: Place { get { realPlace } }
+	let type: String
+	let stat: FancferC.statx_st
+
+	init(fsRef: FSRef, place: RealPlace) throws {
+		self.fsRef = fsRef
+		self.realPlace = place
+		var stat: FancferC.statx_st = FancferC.statx_st()
+		guard withUnsafeMutablePointer(to: &stat, { (statx_ptr) in
+			fsRef.path.withCString { (path_ptr) in
+				FancferC.statx(fsRef.dir?.fd ?? AT_FDCWD, path_ptr, Glibc.AT_SYMLINK_NOFOLLOW, FancferC.STATX_ALL, statx_ptr)
+			}
+		}) != -1 else {
+			throw CError(errno: Glibc.errno)
+		}
+		self.stat = stat
+		switch Glibc.mode_t(self.stat.stx_mode) & Glibc.S_IFMT {
+			case Glibc.S_IFDIR: self.type = "dir"
+			case Glibc.S_IFREG: self.type = "blob"
+			// case FancferC.S_IFLNK:
+			default: throw TODO()
+		}
+	}
+}
+enum RealPlace: Place {
+	case dir(String, RealRef)
+	case srcArg(RealRef)
+	case srcVal(RealRef)
+	case root
+
+	var ref: Ref? { get { switch self {
+		case .dir(_, let ref): return ref
+		case .srcArg(let ref): return ref
+		case .srcVal(let ref): return ref
+		case .root: return nil
+	} } }
+}
+class LongPlace {
+	let short: Place
+	let ext: (Int, LongPlace)?
+	init(short: Place, ext: (Int, LongPlace)?) {
+		self.short = short
+		self.ext = ext
+	}
+}
+struct LongRef {
+	let short: Ref
+	let ext: (Int, LongPlace)?
 }
 
 let root = try Directory(ref: FSRef(dir: nil, path: "../test-repo"))
